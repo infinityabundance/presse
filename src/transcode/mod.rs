@@ -313,8 +313,8 @@ pub(crate) fn jpeg_components(data: &[u8]) -> Option<u8> {
         }
         let marker = data[i + 1];
         match marker {
-            0xD8 | 0xD0..=0xD7 => i += 2, // SOI / RSTn
-            0xD9 | 0xDA => return None,   // EOI / SOS: no frame seen
+            0xD0..=0xD8 => i += 2,      // RSTn / SOI
+            0xD9 | 0xDA => return None, // EOI / SOS: no frame seen
             m if SOF_MARKERS.contains(&m) => {
                 // precision(1) height(2) width(2) components(1)
                 return Some(data[i + 9]);
