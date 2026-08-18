@@ -118,3 +118,27 @@ the PCIe-latency guard):
   context init (~0.15 s), so it is a correctness/size feature today; the
   CUDA-stream + pinned-memory batching needed to beat the CPU engine is
   future work.
+
+## Large image-heavy PDFs (generated photo corpus)
+
+`benches/docker/bench_gpu.sh` fetches real photos (deterministic Lorem Picsum
+seeds, 6 MP and 17.5 MP) and assembles four PDFs (12–36 MB, 10–60 images),
+then times cpu-parallel / cpu-serial / cuda / ghostscript (best of 3).
+RTX 4080 SUPER, 16-core CPU, `-C target-cpu=native`, `-q 50`:
+
+| PDF | cpu-par 16c | cpu-serial | cuda (pool) | gs /ebook |
+|---|---|---|---|---|
+| photos20 (20×6 MP) | 0.173 s | 1.201 s | 0.447 s | 0.248 s |
+| photos60 (60 imgs) | 0.323 s | 1.330 s | 0.716 s | 0.660 s |
+| photos10big (10×17.5 MP) | 0.273 s | 0.736 s | 0.556 s | 0.330 s |
+
+- The GPU handle pool (per-worker nvjpeg handles instead of one mutex) cut
+  the multi-image case 1.054 → 0.716 s (1.47×) and beats 2-core CPU
+  parallel (photos20 0.440 vs 0.626 s); 16-core CPU parallel still wins
+  overall on wall time.
+- GPU output is visually identical (SSIM 1.0000 on all 20 photo pages,
+  qpdf clean) and 16–25 % smaller than the CPU encoder at the same quality
+  (nvJPEG optimized Huffman).
+- Crossover: the CUDA pool ≈ or > CPU parallel at ≤ 2 cores; CPU wins from
+  4 cores up. GPU is the right default when cores are scarce or size
+  matters more than wall time.
