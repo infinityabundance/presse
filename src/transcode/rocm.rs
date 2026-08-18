@@ -16,7 +16,9 @@ use libloading::{Library, Symbol};
 use std::ffi::{c_int, c_void};
 use std::sync::Mutex;
 
-use crate::transcode::{ImageRef, ImageTranscoder, Input, TranscodeError, encode_jpeg};
+use crate::transcode::{
+    ImageRef, ImageTranscoder, Input, TranscodeError, encode_jpeg, jpeg_components,
+};
 
 type Status = c_int;
 
@@ -186,6 +188,15 @@ impl ImageTranscoder for RocmTranscoder {
             match input {
                 // GPU decode, CPU encode (rocJPEG encoder ABI not yet validated).
                 Input::Jpeg(bytes) => {
+                    // Grayscale JPEGs have no GPU input format; keep them on
+                    // the CPU path so /DeviceGray streams stay single-channel.
+                    if jpeg_components(bytes) == Some(1) {
+                        return Err(TranscodeError::Encode(
+                            "rocJPEG has no single-channel input format; the CPU backend \
+                             preserves /DeviceGray JPEGs"
+                                .into(),
+                        ));
+                    }
                     let (w, h, rgb) = self.decode(bytes)?;
                     let img = image::RgbImage::from_raw(w, h, rgb)
                         .map(image::DynamicImage::ImageRgb8)

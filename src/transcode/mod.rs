@@ -289,6 +289,42 @@ pub fn resolve(acceleration: Acceleration) -> Result<RuntimeTranscoder, String> 
     }
 }
 
+/// JPEG marker segment types that carry a frame header (SOF).
+/// `0xC4` (DHT), `0xC8` (JPG) and `0xCC` (DAC) are excluded.
+const SOF_MARKERS: &[u8] = &[
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+];
+
+/// Number of components declared by the JPEG frame header, if the stream is
+/// a decodable baseline/progressive JPEG.
+///
+/// GPU backends use this as a guard: nvJPEG/rocJPEG expose no single-channel
+/// (grayscale) input format, so 1-component JPEGs must be rejected before
+/// they reach the GPU — otherwise the decoded RGB output would be written
+/// into a `/DeviceGray` stream and rendered as garbage by viewers.
+// Used only by the `cuda`/`rocm` feature-gated backends.
+#[allow(dead_code)]
+pub(crate) fn jpeg_components(data: &[u8]) -> Option<u8> {
+    let mut i = 2; // skip SOI
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        match marker {
+            0xD8 | 0xD0..=0xD7 => i += 2, // SOI / RSTn
+            0xD9 | 0xDA => return None,   // EOI / SOS: no frame seen
+            m if SOF_MARKERS.contains(&m) => {
+                // precision(1) height(2) width(2) components(1)
+                return Some(data[i + 9]);
+            }
+            _ => i += 2 + u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize,
+        }
+    }
+    None
+}
+
 /// Encode `img` as JPEG at the given quality, preserving grayscale payloads.
 ///
 /// `DynamicImage` always presents an RGB pixel type to the encoder, so a
@@ -349,5 +385,45 @@ impl TranscodeCache {
             .entry(key)
             .or_insert_with(|| Arc::clone(&produced));
         produced
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jpeg_components;
+
+    /// Build a minimal JPEG with the given component count by emitting a
+    /// scan-less frame header (SOF0) after SOI.
+    fn fake_jpeg(components: u8) -> Vec<u8> {
+        let mut b = vec![0xFF, 0xD8]; // SOI
+        b.extend_from_slice(&[0xFF, 0xC0]); // SOF0
+        b.extend_from_slice(&[0x00, 0x11]); // length 17
+        b.push(8); // precision
+        b.extend_from_slice(&[0x00, 0x40, 0x00, 0x40]); // 64x64
+        b.push(components);
+        for i in 0..components {
+            b.extend_from_slice(&[i, 0x11, 0x00]); // id, sampling, quant table
+        }
+        b
+    }
+
+    #[test]
+    fn jpeg_components_counts_channels() {
+        assert_eq!(jpeg_components(&fake_jpeg(1)), Some(1));
+        assert_eq!(jpeg_components(&fake_jpeg(3)), Some(3));
+    }
+
+    #[test]
+    fn jpeg_components_skips_non_frame_segments() {
+        // APP0 before SOF0 must be skipped, and non-JPEG input must yield None.
+        let mut b = vec![0xFF, 0xD8];
+        b.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]); // APP0, length 16
+        b.extend_from_slice(&[
+            0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+        ]); // 14-byte payload (APP0 length 16 includes its own 2 bytes)
+        b.extend_from_slice(&fake_jpeg(3)[2..]);
+        assert_eq!(jpeg_components(&b), Some(3));
+        assert_eq!(jpeg_components(b"not a jpeg"), None);
+        assert_eq!(jpeg_components(&[]), None);
     }
 }

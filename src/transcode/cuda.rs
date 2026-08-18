@@ -24,7 +24,7 @@
 
 use baracuda_nvjpeg_sys as nvjpeg;
 
-use crate::transcode::{ImageRef, ImageTranscoder, Input, TranscodeError};
+use crate::transcode::{ImageRef, ImageTranscoder, Input, TranscodeError, jpeg_components};
 use std::ffi::c_int;
 use std::ptr;
 use std::sync::Mutex;
@@ -310,6 +310,13 @@ impl ImageTranscoder for CudaTranscoder {
         unsafe {
             match input {
                 Input::Jpeg(bytes) => {
+                    if jpeg_components(bytes) == Some(1) {
+                        return Err(TranscodeError::Encode(
+                            "nvJPEG has no single-channel input format; the CPU backend \
+                             preserves /DeviceGray JPEGs"
+                                .into(),
+                        ));
+                    }
                     let (w, h, rgb) = inner.decode(bytes)?;
                     inner.encode(w, h, &rgb, (w * 3) as usize, quality)
                 }
