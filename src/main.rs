@@ -2,6 +2,7 @@
 mod macros;
 mod cli;
 mod pdf;
+mod transcode;
 
 // Rayon workers constantly allocate and drop temporary buffers during image
 // transcoding; mimalloc has per-thread caches that avoid contention on the
@@ -11,12 +12,13 @@ mod pdf;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use pdf::builder::image_to_pdf;
-use pdf::images::compress_images;
+use pdf::images::{compress_images, compress_images_with};
 use pdf::merger::merge;
 use pdf::reader::{
     get_compression_ratio_in_percent, get_pdf_size_in_kilobytes, load_input_as_pdf, load_pdf,
 };
 use pdf::writer::{compress_and_save_pdf, save_pdf};
+use transcode::resolve;
 
 use clap::Parser;
 use cli::args::{
@@ -34,8 +36,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             input,
             output,
             quality,
+            acceleration,
             verbose,
         } => {
+            // Resolve the transcoding backend up front: requesting a backend
+            // that was not compiled in is an explicit error; a compiled-in
+            // backend whose driver is missing warns and falls back to CPU.
+            let transcoder = resolve(acceleration)?;
             let bar = ProgressBar::new(input.len() as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
@@ -76,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                compress_images(&mut doc, quality, verbose);
+                compress_images_with(&mut doc, quality, verbose, &transcoder);
 
                 // Compressing the document
                 let output = resolve_press_path_output(file_path, &output);

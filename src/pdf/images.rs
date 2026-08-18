@@ -1,12 +1,9 @@
-use image::DynamicImage;
-use image::codecs::jpeg::JpegEncoder;
 use lopdf::{Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
 
-use ahash::AHasher;
+use crate::transcode::{
+    CpuTranscoder, ImageRef, ImageTranscoder, Input, TranscodeCache, encode_key,
+};
 
 /// Fixed-size block used for raw pixel buffer processing.
 /// 32 KiB keeps the working set inside the L1/L2 caches (and aligned with
@@ -14,62 +11,15 @@ use ahash::AHasher;
 /// instead of one long linear sweep.
 const CHUNK_SIZE: usize = 32 * 1024;
 
-/// Cache of re-encoded JPEG buffers, keyed by a hash of the exact pixels fed
-/// to the encoder plus the target quality. PDFs embed identical images
-/// (logos, watermarks, headers) dozens of times across separate object ids;
-/// one encode serves every copy. On a miss the encoder runs *outside* the
-/// lock, so parallel workers never serialize behind the cache.
-struct ReencodeCache {
-    map: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
-}
-
-impl ReencodeCache {
-    fn new() -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Return the cached buffer for `key`, or produce it with `encode` and
-    /// cache it. An empty buffer means "could not encode" and is cached too,
-    /// so every duplicate skips identically.
-    fn get(&self, key: u64, encode: impl FnOnce() -> Vec<u8>) -> Arc<Vec<u8>> {
-        if let Some(buf) = self.map.lock().unwrap().get(&key) {
-            return Arc::clone(buf);
-        }
-        let buf = Arc::new(encode());
-        self.map
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&buf));
-        buf
-    }
-}
-
-/// Key for the re-encode cache: target quality + the exact pixel bytes the
-/// JPEG encoder will see (channel count tags luma vs rgb payloads).
-fn encode_key(quality: u8, img: &DynamicImage) -> u64 {
-    let mut h = AHasher::default();
-    h.write_u8(quality);
-    match img {
-        DynamicImage::ImageLuma8(g) => {
-            h.write_u8(1);
-            g.as_raw().hash(&mut h);
-        }
-        DynamicImage::ImageRgb8(g) => {
-            h.write_u8(3);
-            g.as_raw().hash(&mut h);
-        }
-        other => {
-            h.write_u8(0);
-            other.as_bytes().hash(&mut h);
-        }
-    }
-    h.finish()
-}
-
 /// Replace JPEG images in a document by a compressed version to the given quality.
+/// Only JPEG images are replaced, the other are skipped.
+///
+/// Uses the default CPU backend (see [`compress_images_with`]).
+pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
+    compress_images_with(doc, quality, verbose, &CpuTranscoder);
+}
+
+/// Replace JPEG images in a document using the given transcoding backend.
 /// Only JPEG images are replaced, the other are skipped.
 ///
 /// The pipeline is split in three phases:
@@ -81,7 +31,12 @@ fn encode_key(quality: u8, img: &DynamicImage) -> u64 {
 /// 3. **Apply** — write the re-encoded streams (and updated `/Filter` +
 ///    `/Length` dictionary entries) back into the object tree in a single
 ///    serial pass, right before serialization.
-pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
+pub fn compress_images_with<T: ImageTranscoder>(
+    doc: &mut Document,
+    quality: u8,
+    verbose: bool,
+    transcoder: &T,
+) {
     // Phase 1 — extract.
     let image_ids: Vec<ObjectId> = doc
         .objects
@@ -103,13 +58,13 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 
     // Deduplication cache: identical images (logos, watermarks, headers)
     // appear dozens of times in real PDFs; encode each unique image once.
-    let cache = ReencodeCache::new();
+    let cache = TranscodeCache::new();
 
     // Phase 2 — re-encode in parallel (pure, lock-free).
     let reencoded: Vec<(ObjectId, Stream)> = images
         .into_par_iter()
         .map(|(id, stream)| {
-            let stream = reencode_image_stream(id, stream, quality, verbose, &cache);
+            let stream = reencode_image_stream(id, stream, quality, verbose, &cache, transcoder);
             (id, stream)
         })
         .collect();
@@ -126,12 +81,13 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 /// Returns the stream that should be stored back: the original, untouched,
 /// when nothing could or should be re-encoded; a modified copy carrying the
 /// new JPEG payload and updated `/Filter` + `/Length` entries otherwise.
-fn reencode_image_stream(
+fn reencode_image_stream<T: ImageTranscoder>(
     id: ObjectId,
     mut stream: Stream,
     quality: u8,
     verbose: bool,
-    cache: &ReencodeCache,
+    cache: &TranscodeCache,
+    transcoder: &T,
 ) -> Stream {
     let color_space_raw = stream
         .dict
@@ -210,32 +166,27 @@ fn reencode_image_stream(
 
     let buf: Vec<u8> = match filter {
         Some(b"DCTDecode") | Some(b"JPXDecode") => {
-            verbose!(
-                verbose,
-                "[img {:?}] → processing JPEG/JPX via image::load_from_memory",
-                id
-            );
-            let img = match image::load_from_memory(&stream.content) {
-                Ok(data) => data,
-                Err(e) => {
+            verbose!(verbose, "[img {:?}] → processing JPEG/JPX via backend", id);
+            // Identical JPEG bytes re-encode identically: encode once, reuse
+            // the cached buffer for every duplicate image object.
+            let input = Input::Jpeg(&stream.content);
+            let key = encode_key(quality, 2, &stream.content);
+            let result = cache.get(key, || transcoder.transcode_image(&input, quality));
+            match result.as_ref() {
+                Ok(buf) if !buf.is_empty() => buf.clone(),
+                Ok(_) => {
                     verbose!(
                         verbose,
-                        "[img {:?}] → skipped: load_from_memory failed: {}",
-                        id,
-                        e
+                        "[img {:?}] → skipped: backend produced empty output",
+                        id
                     );
                     return stream;
                 }
-            };
-            // Identical JPEG bytes re-encode identically: encode once, reuse
-            // the cached buffer for every duplicate image object.
-            let key = encode_key(quality, &img);
-            let buf = cache.get(key, || {
-                let mut out = Vec::new();
-                encode_jpeg(&mut out, &img, quality);
-                out
-            });
-            buf.as_ref().clone()
+                Err(e) => {
+                    verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                    return stream;
+                }
+            }
         }
         Some(other_filter) => {
             verbose!(
@@ -258,12 +209,12 @@ fn reencode_image_stream(
                 }
             };
 
-            let img = match raw_pixels_to_image(raw, width, height, color_space_raw, id, verbose) {
-                Some(i) => i,
+            let classified = match classify_raw(&raw, width, height, color_space_raw) {
+                Some(c) => c,
                 None => {
                     verbose!(
                         verbose,
-                        "[img {:?}] → skipped: from_raw failed (mismatched dimensions or unsupported format, expected {}x{}x{} bytes)",
+                        "[img {:?}] → skipped: mismatched dimensions or unsupported format, expected {}x{}x{} bytes",
                         id,
                         width,
                         height,
@@ -276,15 +227,55 @@ fn reencode_image_stream(
                     return stream;
                 }
             };
+            let (input, key_bytes, tag): (Input<'_>, &[u8], u8) = match &classified {
+                RawPixels::Luma(bytes) => (
+                    Input::Pixels(ImageRef::Luma8 {
+                        width,
+                        height,
+                        bytes,
+                    }),
+                    bytes,
+                    1,
+                ),
+                RawPixels::Rgb(bytes) => (
+                    Input::Pixels(ImageRef::Rgb8 {
+                        width,
+                        height,
+                        bytes,
+                    }),
+                    bytes,
+                    3,
+                ),
+                RawPixels::RgbaNormalized(rgb) => (
+                    Input::Pixels(ImageRef::Rgb8 {
+                        width,
+                        height,
+                        bytes: rgb.as_slice(),
+                    }),
+                    rgb.as_slice(),
+                    3,
+                ),
+            };
+
             // Same pixels → same JPEG, regardless of how the source stream
             // happened to be compressed.
-            let key = encode_key(quality, &img);
-            let buf = cache.get(key, || {
-                let mut out = Vec::new();
-                encode_jpeg(&mut out, &img, quality);
-                out
-            });
-            buf.as_ref().clone()
+            let key = encode_key(quality, tag, key_bytes);
+            let result = cache.get(key, || transcoder.transcode_image(&input, quality));
+            match result.as_ref() {
+                Ok(buf) if !buf.is_empty() => buf.clone(),
+                Ok(_) => {
+                    verbose!(
+                        verbose,
+                        "[img {:?}] → skipped: backend produced empty output",
+                        id
+                    );
+                    return stream;
+                }
+                Err(e) => {
+                    verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                    return stream;
+                }
+            }
         }
         None => {
             verbose!(
@@ -333,25 +324,19 @@ fn reencode_image_stream(
     stream
 }
 
-/// Encode `img` as JPEG at the given quality, preserving grayscale payloads.
-///
-/// `DynamicImage` always presents an RGB pixel type to the encoder, so a
-/// Luma8 payload would be written as a 3-component JPEG — invalid inside a
-/// `/DeviceGray` stream and rendered as washed-out garbage by viewers.
-/// Encoding the concrete `GrayImage` keeps the JPEG at a single component.
-fn encode_jpeg(out: &mut Vec<u8>, img: &DynamicImage, quality: u8) {
-    let mut encoder = JpegEncoder::new_with_quality(std::io::Cursor::new(out), quality);
-    match img {
-        DynamicImage::ImageLuma8(gray) => {
-            let _ = encoder.encode_image(gray);
-        }
-        other => {
-            let _ = encoder.encode_image(other);
-        }
-    }
+/// A raw (decompressed) pixel buffer, classified into a backend-friendly
+/// layout.
+enum RawPixels<'a> {
+    /// 1 byte/pixel grayscale.
+    Luma(&'a [u8]),
+    /// 3 bytes/pixel interleaved RGB.
+    Rgb(&'a [u8]),
+    /// A 4-byte/pixel `DeviceRGB` stream normalized to RGB by dropping the
+    /// alpha channel in fixed-size chunks (owned result).
+    RgbaNormalized(Vec<u8>),
 }
 
-/// Wrap a decompressed pixel buffer into an `image` crate image.
+/// Classify a decompressed pixel buffer.
 ///
 /// Canonical layouts are wrapped zero-copy: `DeviceGray` → 1 byte/pixel,
 /// `DeviceRGB` → 3 bytes/pixel. Streams that illegally carry a fourth (alpha)
@@ -359,47 +344,28 @@ fn encode_jpeg(out: &mut Vec<u8>, img: &DynamicImage, quality: u8) {
 /// alpha channel in fixed-size chunks (each 32 KiB chunk holds a whole number
 /// of 4-byte pixels, so a pixel never straddles a chunk boundary). Anything
 /// else is rejected (`None` → the stream is skipped by the caller).
-fn raw_pixels_to_image(
-    raw: Vec<u8>,
+fn classify_raw<'a>(
+    raw: &'a [u8],
     width: u32,
     height: u32,
     color_space: Option<&[u8]>,
-    id: ObjectId,
-    verbose: bool,
-) -> Option<DynamicImage> {
+) -> Option<RawPixels<'a>> {
     let (w, h) = (width as usize, height as usize);
     let area = w.checked_mul(h)?;
 
     match color_space {
-        Some(b"DeviceGray") => {
-            if raw.len() == area {
-                image::GrayImage::from_raw(width, height, raw).map(DynamicImage::ImageLuma8)
-            } else {
-                None
-            }
-        }
-        _ => {
-            let rgb_len = area.checked_mul(3)?;
-            if raw.len() == rgb_len {
-                image::RgbImage::from_raw(width, height, raw).map(DynamicImage::ImageRgb8)
-            } else if raw.len() == area.checked_mul(4)? {
-                verbose!(
-                    verbose,
-                    "[img {:?}] → 4 bytes/px on DeviceRGB stream, dropping alpha in {}B chunks",
-                    id,
-                    CHUNK_SIZE
-                );
-                let mut rgb = Vec::with_capacity(rgb_len);
-                for chunk in raw.chunks(CHUNK_SIZE) {
-                    for px in chunk.chunks_exact(4) {
-                        rgb.extend_from_slice(&px[..3]);
-                    }
+        Some(b"DeviceGray") if raw.len() == area => Some(RawPixels::Luma(raw)),
+        _ if raw.len() == area.checked_mul(3)? => Some(RawPixels::Rgb(raw)),
+        _ if raw.len() == area.checked_mul(4)? => {
+            let mut rgb = Vec::with_capacity(area * 3);
+            for chunk in raw.chunks(CHUNK_SIZE) {
+                for px in chunk.chunks_exact(4) {
+                    rgb.extend_from_slice(&px[..3]);
                 }
-                image::RgbImage::from_raw(width, height, rgb).map(DynamicImage::ImageRgb8)
-            } else {
-                None
             }
+            Some(RawPixels::RgbaNormalized(rgb))
         }
+        _ => None,
     }
 }
 

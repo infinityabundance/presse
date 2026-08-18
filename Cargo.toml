@@ -16,6 +16,15 @@ path-guid = "20B73937-7905-4D33-B513-8D635C4BB57C"
 license = false
 eula = false
 
+[features]
+default = []
+# NVIDIA nvJPEG backend (--acceleration cuda). Loads libnvjpeg at runtime via
+# baracuda's dynamic loader — no CUDA toolkit needed to build, no link-time
+# driver dependency.
+cuda = ["dep:baracuda-nvjpeg-sys"]
+# AMD rocJPEG backend (--acceleration rocm). Loads librocjpeg at runtime.
+rocm = ["dep:libloading"]
+
 [dependencies]
 # PDF manipulation
 lopdf = "0.44"
@@ -40,6 +49,10 @@ ahash = "0.8"
 
 # Zero-copy input reads
 memmap2 = "0.9"
+
+# GPU backends (optional, see [features])
+baracuda-nvjpeg-sys = { version = "0.0.1-alpha.79", optional = true }
+libloading = { version = "0.8", optional = true }
 
 # Faster allocation for the many small buffers rayon workers create.
 # Not on musl: mimalloc-sys needs a C toolchain the musl target lacks.
