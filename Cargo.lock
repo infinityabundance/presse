@@ -1404,6 +1404,7 @@ name = "presse"
 version = "0.3.2"
 dependencies = [
  "ahash",
+ "baracuda-cuda-sys",
  "baracuda-nvjpeg-sys",
  "clap",
  "flate2",
