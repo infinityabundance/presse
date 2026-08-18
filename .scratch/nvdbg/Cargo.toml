@@ -1,0 +1,7 @@
+[package]
+name = "nvdbg"
+version = "0.0.1"
+edition = "2021"
+[dependencies]
+baracuda-cuda-sys = "0.0.1-alpha.79"
+baracuda-nvjpeg-sys = "0.0.1-alpha.79"

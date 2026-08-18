@@ -25,6 +25,15 @@ pub fn compress_and_save_pdf(
         doc.objects.len()
     );
 
+    // Real-world PDFs usually carry gaps in their object numbering (deleted
+    // objects, preserved source ids). lopdf's xref writer opens a new xref
+    // section at the first *missing* id but appends the next present object's
+    // entry to it, shifting every subsequent entry whenever a gap exists — a
+    // corruption qpdf rejects and poppler can render as blank pages. Renumber
+    // to contiguous ids first so both the xref-table and xref-stream writers
+    // stay correct.
+    doc.renumber_objects();
+
     doc.compress();
 
     verbose!(verbose, "[writer] saving to '{}'", name);
@@ -37,6 +46,9 @@ pub fn compress_and_save_pdf(
 
 pub fn save_pdf(doc: &mut Document, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Document::delete_zero_length_streams(doc);
+    // See compress_and_save_pdf: lopdf's xref writers mis-handle gaps in
+    // object numbering, so compact the ids before saving.
+    doc.renumber_objects();
     doc.compress();
     doc.save(name)?;
     Ok(())

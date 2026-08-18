@@ -58,6 +58,15 @@ Measured over 19 real-world PDFs, comparing `presse press --quality 50` against 
 
 Presse is **~7× faster** and compresses more effectively on this corpus. Ghostscript's `/ebook` preset can inflate already-optimised documents by downsampling images that are below its target DPI.
 
+Image re-encoding is **parallelized with [rayon](https://github.com/rayon-rs/rayon)** across all available CPU threads — on a 16-core machine a 24-image PDF compresses ~6× faster than single-threaded. A reproducible containerized benchmark harness lives in [`benches/docker/`](benches/docker/):
+
+```bash
+docker build -t presse-bench -f benches/docker/Dockerfile.bench .
+docker run --rm presse-bench
+```
+
+The container builds with `RUSTFLAGS="-C target-cpu=native"` (AVX2/FMA auto-vectorization) and reports wall time, throughput, and peak RSS for a generated corpus (text-heavy, image-heavy, scanned), comparing the rayon pipeline against a `RAYON_NUM_THREADS=1` baseline.
+
 ## Usage
 
 ### Compress — `presse press`
@@ -131,6 +140,7 @@ presse merge a.pdf b.pdf --compress
 - [clap](https://github.com/clap-rs/clap) — CLI argument parsing
 - [indicatif](https://github.com/console-rs/indicatif) — Progress bars
 - [image](https://github.com/image-rs/image) — JPEG decoding and encoding
+- [rayon](https://github.com/rayon-rs/rayon) — parallel image re-encoding
 
 ## Contributions
 We are happy to welcome contributions! Pull requests are welcome.
