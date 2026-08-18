@@ -91,3 +91,30 @@ not size.
 
 One corpus candidate (a Brotli-compressed file) cannot be loaded by lopdf at
 all (`BrotliDecode` unsupported) and is skipped with a warning.
+
+## GPU acceleration (`--acceleration cuda`, opt-in `cuda` feature)
+
+The same 100-PDF corpus run through `presse press -a cuda -q 50` (nvJPEG
+backend on an RTX 4080 SUPER / CUDA 13.3; streams < 128 KiB stay on CPU per
+the PCIe-latency guard):
+
+- **Correctness: 100/100 docs compressed with zero failures.** qpdf gate
+  matches the CPU path (94 fully clean + 3 benign "input stream is complete"
+  warnings + the pre-existing `issue7229` source artifact), and the visual
+  sweep is **97/100 clean** — the only flag is that same pre-existing
+  malformed-source artifact; two known corpus files are skipped at load.
+- **Grayscale guard:** nvJPEG has no single-channel input format, so
+  1-component JPEGs (and `/DeviceGray` streams) are routed to the CPU encoder.
+  Without this guard, grayscale JPEGs were re-encoded as RGB inside
+  `/DeviceGray` streams and rendered as garbage (found via the visual sweep on
+  `pdfjs_22060_A1_01_Plans`; fixed in `src/transcode/`).
+- **Size:** nvJPEG's optimized Huffman tables shrink image-heavy docs further
+  than the CPU encoder at the same quality — measured 9–22% smaller on
+  duplicate/image-heavy arXiv papers (gpt3 4.3 vs 5.6 MB, styleGAN 5.4 vs
+  6.7 MB).
+- **Wall time:** slower than the CPU path on this corpus (0.62× overall on
+  the 25 image-heavy docs). The current backend serializes every stream
+  behind a mutex with host-memory round-trips and pays a per-process CUDA
+  context init (~0.15 s), so it is a correctness/size feature today; the
+  CUDA-stream + pinned-memory batching needed to beat the CPU engine is
+  future work.
