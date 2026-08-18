@@ -59,17 +59,9 @@ libloading = { version = "0.8", optional = true }
 [target.'cfg(not(target_env = "musl"))'.dependencies]
 mimalloc = "0.1"
 
-[patch.crates-io]
-# Vendored fork of lopdf 0.39.0 with a fix for its xref writer (see
-# vendor/lopdf/README.md) — upstream lopdf writes corrupt cross-reference
-# sections whenever object numbering has gaps and truncates entries past the
-# pre-stream `size`, producing PDFs that qpdf rejects and poppler can render
-# as blank pages. No API changes.
-lopdf = { path = "vendor/lopdf" }
-
 [dev-dependencies]
 # Same major/minor as the main deps, shared by tests/ and examples/ (corpus generator)
-lopdf = "0.39"
+lopdf = "0.44"
 image = "0.25"
 
 # The profile that 'dist' will build with

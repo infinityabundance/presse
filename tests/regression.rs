@@ -831,6 +831,12 @@ fn press_cli_end_to_end() {
 /// object-stream entries — which qpdf rejects and poppler can render as
 /// blank pages. This test builds a document with both properties and asserts
 /// the compressed output stays valid (qpdf gate + render).
+///
+/// Passes on lopdf >= 0.44 because the save path already calls
+/// `renumber_objects()`: compacting the numbering makes the writer's
+/// remaining gap/size quirks unreachable (verified: same /Size, same entry
+/// count, nothing missing — identical to the previously vendored writer
+/// patch).
 #[test]
 fn gapped_numbering_with_multiple_object_streams_is_valid() {
     let dir = test_dir();
