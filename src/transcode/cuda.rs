@@ -7,29 +7,42 @@
 //! [`TranscodeError`] and the caller's [`FallbackTranscoder`] degrades to
 //! the CPU backend.
 //!
-//! Pipeline: every [`Inner`] owns a dedicated CUDA stream. The decode and
-//! encode calls are enqueued on that stream (async), so kernels and the
-//! host↔device copies of one image overlap with other handles' streams —
-//! the pool lets each rayon worker keep the GPU busy. JPEGs are decoded to
-//! planar YUV (1.5 bytes/pixel, no RGB round-trip) and re-encoded from YUV
-//! at the source chroma subsampling; formats nvJPEG cannot do in YUV (odd
-//! subsamplings, raw RGB streams) fall back to interleaved RGB. Decode
-//! output and the encoded bitstream use pinned host memory
-//! ([`cudaHostAlloc`]) when available so the copies are DMA-direct instead
-//! of staged through pageable bounce buffers.
+//! The backend is a dedicated GPU consumer thread fed by the rayon
+//! producers through an mpsc queue: the CPU (small streams, grayscale and
+//! raw-RGB encodes, stream hashing, lopdf work) and the GPU (large JPEG
+//! re-encodes) run concurrently instead of one engine waiting on the other.
 //!
-//! nvJPEG exposes no single-channel input format, so `/DeviceGray` streams
-//! and 1-component JPEGs are routed back to the CPU backend. nvJPEG states
-//! are not thread-safe, so each [`Inner`] is used by one thread at a time
-//! via the handle pool in [`CudaTranscoder`].
+//! A batch of up to [`BATCH_MAX`] images is fanned out across that many
+//! per-slot CUDA streams, and every image is *device-resident*: `nvjpegDecode`
+//! writes directly to device memory (planar YUV) and `nvjpegEncodeYUV` reads
+//! back from that same device memory — no decoded pixel crosses the PCIe
+//! bus (a host round-trip design moves ~26 MB per 17.5 MP image in *and*
+//! back out for every image). Only the compressed bitstreams come back to
+//! the host, through a reusable pinned-memory pool.
+//!
+//! The handle is created with the GPU-hybrid backend (`nvjpegCreate` with
+//! `NVJPEG_BACKEND_GPU_HYBRID`): entropy decoding runs on the GPU instead of
+//! the CPU (the default `nvjpegCreateSimple` backend decodes entropy on the
+//! CPU, competing with the rayon workers), and it is the backend that
+//! accepts decode output in device memory. The nvJPEG hardware decoder
+//! (`NVJPEG_BACKEND_HARDWARE`) is not reachable through `nvjpegCreateEx` on
+//! current drivers, and `nvjpegDecodeBatched` only uses the GPU for batches
+//! of 50+ images — neither is usable here, so decode is per-image on
+//! per-slot streams.
+//!
+//! `/DeviceGray` streams never reach the GPU — nvJPEG has no single-channel
+//! input format, so the CPU backend encodes them (which also keeps the
+//! output valid for the stream's color space).
 
+use baracuda_cuda_sys::runtime::types::cudaStreamFlags;
 use baracuda_cuda_sys::runtime::{self as cudart, cudaError_t, cudaStream_t};
 use baracuda_nvjpeg_sys as nvjpeg;
 
 use crate::transcode::{ImageRef, ImageTranscoder, Input, TranscodeError, jpeg_components};
 use std::ffi::{c_int, c_void};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
 /// `nvjpegInputFormat_t` for the interleaved-RGB fallback encode.
 const NVJPEG_INPUT_RGBI: c_int = 5; // interleaved RGB
@@ -38,6 +51,35 @@ const NVJPEG_INPUT_RGBI: c_int = 5; // interleaved RGB
 const CSS_444: c_int = 0;
 const CSS_422: c_int = 1;
 const CSS_420: c_int = 2;
+
+/// Build optimized Huffman tables for every encode (1) or use the standard
+/// tables (0).
+///
+/// The optimized-table pass runs on the CPU, so disabling it is 12–25%
+/// faster wall time on many-image documents and ~0 on single large images,
+/// at the cost of ~7–8% larger output. Speed is the point of the GPU
+/// backend, so it defaults off.
+const OPTIMIZED_HUFFMAN: c_int = 0;
+
+/// Row pitch alignment for device decode/encode buffers. nvjpeg's GPU
+/// kernels are written against the caller's pitch; 64-byte rows keep them
+/// off the slow path (and avoid odd-pitch edge cases on device output).
+const ROW_ALIGN: usize = 64;
+
+/// Maximum images processed concurrently. The decode/encoder-state pools,
+/// the per-slot streams, and the pinned output pool are all sized to this.
+const BATCH_MAX: usize = 16;
+
+/// Maximum total decoded YUV bytes per batch. Keeps peak device memory
+/// bounded on small-VRAM cards when a batch contains several huge photos
+/// (16 × 17.5 MP × 1.5 B/px would be ~420 MB).
+const BATCH_BUDGET_BYTES: usize = 384 * 1024 * 1024;
+
+/// How long the consumer waits for more jobs to fill a batch after the
+/// first one. Jobs arrive from 16 rayon workers in bursts, so this is
+/// usually zero; the bound just prevents a lone job from being processed
+/// alone when producers are briefly busy elsewhere.
+const COALESCE_TIMEOUT: Duration = Duration::from_micros(300);
 
 fn check(status: nvjpeg::nvjpegStatus_t) -> Result<(), TranscodeError> {
     if status.0 == 0 {
@@ -53,6 +95,10 @@ fn check_cuda(status: cudaError_t) -> Result<(), TranscodeError> {
     } else {
         Err(TranscodeError::Gpu(format!("cuda error {}", status.0)))
     }
+}
+
+fn align_rows(n: usize) -> usize {
+    n.div_ceil(ROW_ALIGN) * ROW_ALIGN
 }
 
 /// Host memory that is pinned (`cudaHostAlloc`) for DMA-direct copies when
@@ -90,13 +136,6 @@ impl HostBuf {
         }
     }
 
-    fn as_ptr(&self) -> *const u8 {
-        match self {
-            HostBuf::Pinned { ptr, .. } => *ptr as *const u8,
-            HostBuf::Heap(v) => v.as_ptr(),
-        }
-    }
-
     fn as_slice(&self) -> &[u8] {
         match self {
             HostBuf::Pinned { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
@@ -118,39 +157,75 @@ impl Drop for HostBuf {
     }
 }
 
-/// nvJPEG handle plus per-process state (decode state, encoder state,
-/// encoder parameters) and a dedicated CUDA stream for async work.
-#[derive(Debug)]
-struct Inner {
-    lib: &'static nvjpeg::Nvjpeg,
-    handle: nvjpeg::nvjpegHandle_t,
-    state: nvjpeg::nvjpegJpegState_t,
-    encoder_state: nvjpeg::nvjpegEncoderState_t,
-    encoder_params: nvjpeg::nvjpegEncoderParams_t,
+/// Device memory holding one decoded image.
+///
+/// Allocated with the stream-ordered allocator (`cudaMallocAsync`) when the
+/// driver supports it — allocation and free are enqueued on the stream
+/// instead of taking the driver lock — with plain `cudaMalloc`/`cudaFree`
+/// as the fallback. The buffer must outlive the encode that reads it, which
+/// the caller guarantees by keeping it alive across `nvjpegEncodeYUV`.
+struct DeviceBuf {
+    ptr: *mut u8,
     stream: cudaStream_t,
+    async_alloc: bool,
 }
 
-// SAFETY: every field is only dereferenced while the handle is borrowed
-// from `CudaTranscoder`'s pool, so no raw handle is ever touched by two
-// threads at once — mirroring how the C library expects to be used.
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
-
-impl Drop for Inner {
+impl Drop for DeviceBuf {
     fn drop(&mut self) {
-        // Intentionally a no-op. The nvjpeg destroy functions can throw a
-        // C++ exception through the `extern "C"` boundary when the driver is
-        // degraded (observed with `nvjpegEncoderParamsDestroy` after a failed
-        // encode: `terminate` is uncatchable from Rust), so teardown is left
-        // to the OS, which reclaims the CUDA context at process exit.
+        if self.ptr.is_null() {
+            return;
+        }
+        let ptr = self.ptr as *mut c_void;
+        unsafe {
+            if self.async_alloc {
+                if let Ok(rt) = cudart::runtime()
+                    && let Ok(f) = rt.cuda_free_async()
+                {
+                    let _ = f(ptr, self.stream);
+                }
+            } else if let Ok(rt) = cudart::runtime()
+                && let Ok(f) = rt.cuda_free()
+            {
+                let _ = f(ptr);
+            }
+        }
     }
 }
 
-/// Create a dedicated CUDA stream; `null` (the synchronous default stream)
-/// when the CUDA runtime cannot be loaded.
+/// One image queued for the GPU consumer thread. `input` is owned so the
+/// consumer never borrows from a rayon worker's stack.
+struct Job {
+    input: JobInput,
+    quality: u8,
+    reply: Sender<Result<Vec<u8>, TranscodeError>>,
+}
+
+enum JobInput {
+    /// JPEG stream bytes (a `/DCTDecode` image stream).
+    Jpeg(Vec<u8>),
+    /// Raw interleaved RGB pixels of a non-JPEG stream.
+    Rgb {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Create a dedicated non-blocking CUDA stream; `null` (the synchronous
+/// default stream) when the CUDA runtime cannot be loaded.
 fn create_stream() -> cudaStream_t {
     if let Ok(rt) = cudart::runtime() {
         let mut stream: cudaStream_t = ptr::null_mut();
+        let ok = unsafe {
+            rt.cuda_stream_create_with_flags()
+                .map(|f| f(&mut stream, cudaStreamFlags::NON_BLOCKING))
+                .is_ok_and(|st| st.0 == 0)
+        };
+        if ok {
+            return stream;
+        }
+        // Older runtimes: a plain stream is still fine — we never use the
+        // legacy default stream, so there is nothing to desynchronize from.
         let ok = unsafe {
             rt.cuda_stream_create()
                 .map(|f| f(&mut stream))
@@ -176,126 +251,171 @@ unsafe fn sync_stream(stream: cudaStream_t) -> Result<(), TranscodeError> {
     check_cuda(unsafe { pfn(stream) })
 }
 
-impl Inner {
-    /// Create one nvjpeg handle with decode state, encoder state, encoder
-    /// parameters, and a dedicated CUDA stream. Fails (as
-    /// [`TranscodeError::Unavailable`]) when the library or driver is not
-    /// present; callers fall back to the CPU backend.
+/// True when the stream-ordered allocator (`cudaMallocAsync`) works on this
+/// driver, so device buffers can be allocated and freed on the stream.
+unsafe fn stream_ordered_alloc_ok(stream: cudaStream_t) -> bool {
+    let Ok(rt) = cudart::runtime() else {
+        return false;
+    };
+    let Ok(alloc) = rt.cuda_malloc_async() else {
+        return false;
+    };
+    let Ok(free) = rt.cuda_free_async() else {
+        return false;
+    };
+    let mut p: *mut c_void = ptr::null_mut();
+    if unsafe { alloc(&mut p, 1, stream) }.0 != 0 || p.is_null() {
+        return false;
+    }
+    let ok = unsafe { free(p, stream) }.0 == 0;
+    let _ = rt.cuda_stream_synchronize().map(|s| unsafe { s(stream) });
+    ok
+}
+
+/// YUV plane geometry: (Y pitch, chroma pitch, chroma height, total bytes)
+/// for an image at the given chroma subsampling. Pitches are 64-byte
+/// aligned for nvjpeg's device kernels.
+fn yuv_geometry(width: usize, height: usize, subsampling: c_int) -> (usize, usize, usize, usize) {
+    let (uw, uh) = match subsampling {
+        CSS_422 => (width.div_ceil(2), height),
+        CSS_420 => (width.div_ceil(2), height.div_ceil(2)),
+        _ => (width, height),
+    };
+    let py = align_rows(width);
+    let puv = align_rows(uw);
+    (py, puv, uh, py * height + 2 * puv * uh)
+}
+
+fn css_enum(subsampling: c_int) -> nvjpeg::nvjpegChromaSubsampling_t {
+    match subsampling {
+        CSS_422 => nvjpeg::nvjpegChromaSubsampling_t::Css422,
+        CSS_444 => nvjpeg::nvjpegChromaSubsampling_t::Css444,
+        _ => nvjpeg::nvjpegChromaSubsampling_t::Css420,
+    }
+}
+
+/// Group YUV-eligible jobs into batches bounded by count and by total
+/// decoded bytes (so a batch of huge photos cannot blow VRAM).
+fn yuv_chunks(items: &[(usize, u32, u32, c_int)]) -> Vec<&[(usize, u32, u32, c_int)]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (k, &(_, w, h, sub)) in items.iter().enumerate() {
+        let size = yuv_geometry(w as usize, h as usize, sub).3;
+        if k - start >= BATCH_MAX || (bytes > 0 && bytes + size > BATCH_BUDGET_BYTES) {
+            out.push(&items[start..k]);
+            start = k;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < items.len() {
+        out.push(&items[start..]);
+    }
+    out
+}
+
+/// All nvjpeg/CUDA state, owned by the single GPU consumer thread. Raw
+/// handles are never touched from more than one thread at a time.
+struct GpuState {
+    lib: &'static nvjpeg::Nvjpeg,
+    /// GPU-hybrid handle (fallback: default): decode and every encode.
+    handle: nvjpeg::nvjpegHandle_t,
+    /// One decode state per batch slot (single-image decode, device output).
+    decode_states: Vec<nvjpeg::nvjpegJpegState_t>,
+    /// One encoder state + params per batch slot, plus one extra for the
+    /// per-image fallback path. Independent states keep every in-flight
+    /// bitstream valid.
+    encoder_states: Vec<nvjpeg::nvjpegEncoderState_t>,
+    encoder_params: Vec<nvjpeg::nvjpegEncoderParams_t>,
+    /// One non-blocking CUDA stream per batch slot.
+    streams: Vec<cudaStream_t>,
+    async_alloc: bool,
+    /// Reusable pinned output buffers (one per batch slot).
+    pinned: Vec<HostBuf>,
+    pinned_cap: Vec<usize>,
+}
+
+impl GpuState {
     fn new() -> Result<Self, TranscodeError> {
         let lib = nvjpeg::nvjpeg()
             .map_err(|e| TranscodeError::Unavailable(format!("nvJPEG library: {e}")))?;
 
         unsafe {
+            // GPU-hybrid backend: entropy decode on the GPU too (the
+            // default `nvjpegCreateSimple` decodes entropy on the CPU,
+            // competing with the rayon workers), and the backend that
+            // accepts decode output in device memory. Falls back to the
+            // default backend on older nvJPEG builds that predate it.
             let mut handle = ptr::null_mut();
-            let pfn = lib
-                .nvjpeg_create_simple()
-                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegCreateSimple: {e}")))?;
-            check(pfn(&mut handle))?;
-
-            let mut state = ptr::null_mut();
-            let pfn = lib
-                .nvjpeg_jpeg_state_create()
-                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegJpegStateCreate: {e}")))?;
-            if let Err(e) = check(pfn(handle, &mut state)) {
-                if let Ok(destroy) = lib.nvjpeg_destroy() {
-                    let _ = destroy(handle);
-                }
-                return Err(e);
+            let backend_ok = if let Ok(pfn) = lib.nvjpeg_create() {
+                check(pfn(
+                    nvjpeg::nvjpegBackend_t::GpuHybrid,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut handle,
+                ))
+                .is_ok()
+            } else {
+                false
+            };
+            if !backend_ok {
+                let pfn = lib
+                    .nvjpeg_create_simple()
+                    .map_err(|e| TranscodeError::Unavailable(format!("nvjpegCreateSimple: {e}")))?;
+                check(pfn(&mut handle))?;
             }
 
-            let mut encoder_state = ptr::null_mut();
-            let pfn = lib.nvjpeg_encoder_state_create().map_err(|e| {
-                TranscodeError::Unavailable(format!("nvjpegEncoderStateCreate: {e}"))
-            })?;
-            if let Err(e) = check(pfn(handle, &mut encoder_state, ptr::null_mut())) {
-                if let Ok(destroy) = lib.nvjpeg_jpeg_state_destroy() {
-                    let _ = destroy(state);
-                }
-                if let Ok(destroy) = lib.nvjpeg_destroy() {
-                    let _ = destroy(handle);
-                }
-                return Err(e);
+            let mut decode_states = Vec::with_capacity(BATCH_MAX);
+            for _ in 0..BATCH_MAX {
+                let mut st = ptr::null_mut();
+                let pfn = lib.nvjpeg_jpeg_state_create().map_err(|e| {
+                    TranscodeError::Unavailable(format!("nvjpegJpegStateCreate: {e}"))
+                })?;
+                check(pfn(handle, &mut st))?;
+                decode_states.push(st);
             }
 
-            let mut encoder_params = ptr::null_mut();
-            let pfn = lib.nvjpeg_encoder_params_create().map_err(|e| {
-                TranscodeError::Unavailable(format!("nvjpegEncoderParamsCreate: {e}"))
-            })?;
-            if let Err(e) = check(pfn(handle, &mut encoder_params, ptr::null_mut())) {
-                if let Ok(destroy) = lib.nvjpeg_encoder_state_destroy() {
-                    let _ = destroy(encoder_state);
-                }
-                if let Ok(destroy) = lib.nvjpeg_jpeg_state_destroy() {
-                    let _ = destroy(state);
-                }
-                if let Ok(destroy) = lib.nvjpeg_destroy() {
-                    let _ = destroy(handle);
-                }
-                return Err(e);
+            let mut encoder_states = Vec::with_capacity(BATCH_MAX + 1);
+            let mut encoder_params = Vec::with_capacity(BATCH_MAX + 1);
+            for _ in 0..=BATCH_MAX {
+                let mut es = ptr::null_mut();
+                let pfn = lib.nvjpeg_encoder_state_create().map_err(|e| {
+                    TranscodeError::Unavailable(format!("nvjpegEncoderStateCreate: {e}"))
+                })?;
+                check(pfn(handle, &mut es, ptr::null_mut()))?;
+                let mut ep = ptr::null_mut();
+                let pfn = lib.nvjpeg_encoder_params_create().map_err(|e| {
+                    TranscodeError::Unavailable(format!("nvjpegEncoderParamsCreate: {e}"))
+                })?;
+                check(pfn(handle, &mut ep, ptr::null_mut()))?;
+                encoder_states.push(es);
+                encoder_params.push(ep);
             }
+
+            let mut streams = Vec::with_capacity(BATCH_MAX);
+            for _ in 0..BATCH_MAX {
+                streams.push(create_stream());
+            }
+            let async_alloc = stream_ordered_alloc_ok(streams[0]);
 
             Ok(Self {
                 lib,
                 handle,
-                state,
-                encoder_state,
+                decode_states,
+                encoder_states,
                 encoder_params,
-                stream: create_stream(),
+                streams,
+                async_alloc,
+                pinned: Vec::new(),
+                pinned_cap: Vec::new(),
             })
         }
     }
 
-    /// Transcode one stream. The decode (for JPEG input) and encode are
-    /// enqueued on [`Self::stream`] back to back, so the whole image is one
-    /// async chain that overlaps with other handles' streams.
-    fn transcode(&self, input: &Input, quality: u8) -> Result<Vec<u8>, TranscodeError> {
-        match input {
-            Input::Jpeg(bytes) => {
-                if jpeg_components(bytes) == Some(1) {
-                    return Err(TranscodeError::Encode(
-                        "nvJPEG has no single-channel input format; the CPU backend \
-                         preserves /DeviceGray JPEGs"
-                            .into(),
-                    ));
-                }
-                let (w, h, subsampling, mut buf) = unsafe { self.decode(bytes) }?;
-                match subsampling {
-                    CSS_420 | CSS_422 | CSS_444 => unsafe {
-                        self.encode_yuv(w, h, subsampling, &buf, quality)
-                    },
-                    _ => unsafe {
-                        self.encode_rgb(w, h, buf.as_mut_ptr(), (w * 3) as usize, quality)
-                    },
-                }
-            }
-            Input::Pixels(ImageRef::Luma8 { .. }) => Err(TranscodeError::Encode(
-                "nvJPEG has no single-channel input format; the CPU backend encodes \
-                 /DeviceGray streams"
-                    .into(),
-            )),
-            Input::Pixels(ImageRef::Rgb8 {
-                width,
-                height,
-                bytes,
-            }) => unsafe {
-                self.encode_rgb(
-                    *width,
-                    *height,
-                    bytes.as_ptr() as *mut _,
-                    (*width * 3) as usize,
-                    quality,
-                )
-            },
-        }
-    }
-
-    /// Enqueue a JPEG decode on the stream (async). Returns the dimensions,
-    /// the source chroma subsampling, and a pinned host buffer holding either
-    /// planar YUV (for 4:2:0/4:2:2/4:4:4 sources) or interleaved RGB.
-    ///
-    /// The buffer must not be read until the stream is synchronized, which
-    /// happens inside the follow-up encode call.
-    unsafe fn decode(&self, data: &[u8]) -> Result<(u32, u32, c_int, HostBuf), TranscodeError> {
+    /// Read the JPEG frame header (dimensions, component count, chroma
+    /// subsampling). Cheap: it only parses the header, no decode work.
+    unsafe fn image_info(&self, data: &[u8]) -> Result<(u32, u32, c_int, c_int), TranscodeError> {
         let mut n_components: c_int = 0;
         let mut subsampling: c_int = 0;
         let mut widths = [0i32; 3];
@@ -315,173 +435,59 @@ impl Inner {
                 heights.as_mut_ptr(),
             )
         })?;
+        Ok((
+            widths[0] as u32,
+            heights[0] as u32,
+            subsampling,
+            n_components,
+        ))
+    }
 
-        let (w, h) = (widths[0] as usize, heights[0] as usize);
-        let pfn = self
-            .lib
-            .nvjpeg_decode()
-            .map_err(|e| TranscodeError::Unavailable(format!("nvjpegDecode: {e}")))?;
-
-        // Planar YUV when the source is a 3-component 4:2:0/4:2:2/4:4:4 JPEG:
-        // half the pixels of RGB, no colorspace round-trip, and the encoder
-        // consumes it directly. Everything else decodes to interleaved RGB.
-        if n_components == 3 && matches!(subsampling, CSS_420 | CSS_422 | CSS_444) {
-            let (uw, uh) = match subsampling {
-                CSS_422 => (w.div_ceil(2), h),
-                CSS_420 => (w.div_ceil(2), h.div_ceil(2)),
-                _ => (w, h),
-            };
-            let mut buf = HostBuf::new(w * h + 2 * uw * uh);
-            let base = buf.as_mut_ptr();
-            let mut image = nvjpeg::nvjpegImage_t {
-                channel: unsafe {
-                    [
-                        base,
-                        base.add(w * h),
-                        base.add(w * h + uw * uh),
-                        ptr::null_mut(),
-                    ]
-                },
-                pitch: [w, uw, uw, 0],
-            };
-            check(unsafe {
-                pfn(
-                    self.handle,
-                    self.state,
-                    data.as_ptr(),
-                    data.len(),
-                    nvjpeg::nvjpegOutputFormat_t::Yuv,
-                    &mut image,
-                    self.stream,
-                )
-            })?;
-            Ok((w as u32, h as u32, subsampling, buf))
+    /// Allocate a device buffer on the given stream: stream-ordered
+    /// (`cudaMallocAsync`) when available, plain `cudaMalloc` otherwise.
+    unsafe fn alloc_device(
+        &self,
+        len: usize,
+        stream: cudaStream_t,
+    ) -> Result<DeviceBuf, TranscodeError> {
+        let mut p: *mut c_void = ptr::null_mut();
+        if self.async_alloc {
+            let pfn = cudart::runtime()
+                .map_err(|e| TranscodeError::Gpu(format!("cuda runtime: {e}")))?
+                .cuda_malloc_async()
+                .map_err(|e| TranscodeError::Gpu(format!("cudaMallocAsync: {e}")))?;
+            check_cuda(unsafe { pfn(&mut p, len, stream) })?;
         } else {
-            let mut buf = HostBuf::new(w * h * 3);
-            let mut image = nvjpeg::nvjpegImage_t {
-                channel: [
-                    buf.as_mut_ptr(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                ],
-                pitch: [w * 3, 0, 0, 0],
-            };
-            check(unsafe {
-                pfn(
-                    self.handle,
-                    self.state,
-                    data.as_ptr(),
-                    data.len(),
-                    nvjpeg::nvjpegOutputFormat_t::Rgbi,
-                    &mut image,
-                    self.stream,
-                )
-            })?;
-            Ok((w as u32, h as u32, subsampling, buf))
+            let pfn = cudart::runtime()
+                .map_err(|e| TranscodeError::Gpu(format!("cuda runtime: {e}")))?
+                .cuda_malloc()
+                .map_err(|e| TranscodeError::Gpu(format!("cudaMalloc: {e}")))?;
+            check_cuda(unsafe { pfn(&mut p, len) })?;
         }
+        if p.is_null() {
+            return Err(TranscodeError::Gpu("cudaMalloc returned null".into()));
+        }
+        Ok(DeviceBuf {
+            ptr: p as *mut u8,
+            stream,
+            async_alloc: self.async_alloc,
+        })
     }
 
-    /// Encode planar YUV pixels (source subsampling preserved) to a JPEG
-    /// bitstream, enqueued on the stream after the decode.
-    unsafe fn encode_yuv(
+    /// Configure encoder params for one slot. Fresh params carry an invalid
+    /// default subsampling state and make the encode calls return
+    /// `NVJPEG_STATUS_INVALID_PARAMETER` (observed on CUDA 13.3), so the
+    /// sampling factors must be set explicitly before every encode.
+    unsafe fn set_encoder_params(
         &self,
-        width: u32,
-        height: u32,
-        subsampling: c_int,
-        buf: &HostBuf,
         quality: u8,
-    ) -> Result<Vec<u8>, TranscodeError> {
-        let (w, h) = (width as usize, height as usize);
-        let (uw, uh) = match subsampling {
-            CSS_422 => (w.div_ceil(2), h),
-            CSS_420 => (w.div_ceil(2), h.div_ceil(2)),
-            _ => (w, h),
-        };
-        let base = buf.as_ptr() as *mut u8;
-        let image = nvjpeg::nvjpegImage_t {
-            channel: unsafe {
-                [
-                    base,
-                    base.add(w * h),
-                    base.add(w * h + uw * uh),
-                    ptr::null_mut(),
-                ]
-            },
-            pitch: [w, uw, uw, 0],
-        };
-        let subsampling = match subsampling {
-            CSS_422 => nvjpeg::nvjpegChromaSubsampling_t::Css422,
-            CSS_444 => nvjpeg::nvjpegChromaSubsampling_t::Css444,
-            _ => nvjpeg::nvjpegChromaSubsampling_t::Css420,
-        };
-
-        unsafe {
-            self.set_encoder_params(quality)?;
-            let pfn = self
-                .lib
-                .nvjpeg_encode_yuv()
-                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegEncodeYUV: {e}")))?;
-            check(pfn(
-                self.handle,
-                self.encoder_state,
-                self.encoder_params,
-                &image,
-                subsampling,
-                width as c_int,
-                height as c_int,
-                self.stream,
-            ))?;
-            self.retrieve()
-        }
-    }
-
-    /// Encode interleaved RGB pixels to a JPEG bitstream on the stream.
-    /// `src` may be the decode buffer or a raw PDF stream's bytes; it must
-    /// stay valid until the stream is synchronized (inside [`Self::retrieve`]).
-    unsafe fn encode_rgb(
-        &self,
-        width: u32,
-        height: u32,
-        src: *mut u8,
-        pitch: usize,
-        quality: u8,
-    ) -> Result<Vec<u8>, TranscodeError> {
-        let image = nvjpeg::nvjpegImage_t {
-            channel: [src, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()],
-            pitch: [pitch, 0, 0, 0],
-        };
-        unsafe {
-            self.set_encoder_params(quality)?;
-            let pfn = self
-                .lib
-                .nvjpeg_encode_image()
-                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegEncodeImage: {e}")))?;
-            check(pfn(
-                self.handle,
-                self.encoder_state,
-                self.encoder_params,
-                &image,
-                NVJPEG_INPUT_RGBI,
-                width as c_int,
-                height as c_int,
-                self.stream,
-            ))?;
-            self.retrieve()
-        }
-    }
-
-    /// Configure the shared encoder params for one encode.
-    ///
-    /// Freshly-created encoder params carry an invalid default subsampling
-    /// state and make the encode calls return `NVJPEG_STATUS_INVALID_PARAMETER`
-    /// (observed on CUDA 13.3), so the sampling factors must be set
-    /// explicitly before every encode.
-    unsafe fn set_encoder_params(&self, quality: u8) -> Result<(), TranscodeError> {
+        state_idx: usize,
+    ) -> Result<(), TranscodeError> {
+        let params = self.encoder_params[state_idx];
         let pfn = self.lib.nvjpeg_encoder_params_set_quality().map_err(|e| {
             TranscodeError::Unavailable(format!("nvjpegEncoderParamsSetQuality: {e}"))
         })?;
-        check(unsafe { pfn(self.encoder_params, quality as c_int, ptr::null_mut()) })?;
+        check(unsafe { pfn(params, quality as c_int, ptr::null_mut()) })?;
 
         let pfn = self
             .lib
@@ -491,7 +497,7 @@ impl Inner {
             })?;
         check(unsafe {
             pfn(
-                self.encoder_params,
+                params,
                 nvjpeg::nvjpegChromaSubsampling_t::Css420,
                 ptr::null_mut(),
             )
@@ -503,84 +509,470 @@ impl Inner {
             .map_err(|e| {
                 TranscodeError::Unavailable(format!("nvjpegEncoderParamsSetOptimizedHuffman: {e}"))
             })?;
-        check(unsafe { pfn(self.encoder_params, 1, ptr::null_mut()) })?;
+        check(unsafe { pfn(params, OPTIMIZED_HUFFMAN, ptr::null_mut()) })?;
         Ok(())
     }
 
-    /// Wait for the enqueued decode+encode, then copy the bitstream out.
-    /// Everything stays on the handle's own stream so it never serializes
-    /// against other handles' work (the legacy null stream would).
-    unsafe fn retrieve(&self) -> Result<Vec<u8>, TranscodeError> {
-        // Query the bitstream size on the stream, then read it.
-        let pfn = self.lib.nvjpeg_encode_retrieve_bitstream().map_err(|e| {
-            TranscodeError::Unavailable(format!("nvjpegEncodeRetrieveBitstream: {e}"))
-        })?;
-        let mut needed = 0usize;
+    /// Enqueue a JPEG decode whose output lands directly in device memory
+    /// (planar YUV, 64-byte row pitches) on slot `stream_idx`'s stream.
+    unsafe fn enqueue_decode_to_device(
+        &self,
+        data: &[u8],
+        width: usize,
+        height: usize,
+        subsampling: c_int,
+        dev: &DeviceBuf,
+        stream_idx: usize,
+    ) -> Result<(), TranscodeError> {
+        let (py, puv, uh, _) = yuv_geometry(width, height, subsampling);
+        let base = dev.ptr;
+        let mut image = nvjpeg::nvjpegImage_t {
+            channel: unsafe {
+                [
+                    base,
+                    base.add(py * height),
+                    base.add(py * height + puv * uh),
+                    ptr::null_mut(),
+                ]
+            },
+            pitch: [py, puv, puv, 0],
+        };
+        let pfn = self
+            .lib
+            .nvjpeg_decode()
+            .map_err(|e| TranscodeError::Unavailable(format!("nvjpegDecode: {e}")))?;
         check(unsafe {
             pfn(
                 self.handle,
-                self.encoder_state,
+                self.decode_states[stream_idx],
+                data.as_ptr(),
+                data.len(),
+                nvjpeg::nvjpegOutputFormat_t::Yuv,
+                &mut image,
+                self.streams[stream_idx],
+            )
+        })
+    }
+
+    /// Enqueue a JPEG encode that reads planar YUV straight from device
+    /// memory into `encoder_states[state_idx]` on `stream_idx`'s stream.
+    #[allow(clippy::too_many_arguments)] // raw-FFI wrapper; arguments are inherent
+    unsafe fn enqueue_encode_yuv(
+        &self,
+        width: u32,
+        height: u32,
+        subsampling: c_int,
+        dev: &DeviceBuf,
+        quality: u8,
+        state_idx: usize,
+        stream_idx: usize,
+    ) -> Result<(), TranscodeError> {
+        let (w, h) = (width as usize, height as usize);
+        let (py, puv, uh, _) = yuv_geometry(w, h, subsampling);
+        let base = dev.ptr;
+        let image = nvjpeg::nvjpegImage_t {
+            channel: unsafe {
+                [
+                    base,
+                    base.add(py * h),
+                    base.add(py * h + puv * uh),
+                    ptr::null_mut(),
+                ]
+            },
+            pitch: [py, puv, puv, 0],
+        };
+        unsafe {
+            self.set_encoder_params(quality, state_idx)?;
+            let pfn = self
+                .lib
+                .nvjpeg_encode_yuv()
+                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegEncodeYUV: {e}")))?;
+            check(pfn(
+                self.handle,
+                self.encoder_states[state_idx],
+                self.encoder_params[state_idx],
+                &image,
+                css_enum(subsampling),
+                width as c_int,
+                height as c_int,
+                self.streams[stream_idx],
+            ))
+        }
+    }
+
+    /// Enqueue an interleaved-RGB encode into `encoder_states[state_idx]`
+    /// on `stream_idx`'s stream. `src` may be host memory (decoded pixels
+    /// or a raw PDF stream); it must stay valid until the stream is
+    /// synchronized.
+    #[allow(clippy::too_many_arguments)] // raw-FFI wrapper; arguments are inherent
+    unsafe fn enqueue_encode_rgb(
+        &self,
+        width: u32,
+        height: u32,
+        src: *mut u8,
+        pitch: usize,
+        quality: u8,
+        state_idx: usize,
+        stream_idx: usize,
+    ) -> Result<(), TranscodeError> {
+        let image = nvjpeg::nvjpegImage_t {
+            channel: [src, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()],
+            pitch: [pitch, 0, 0, 0],
+        };
+        unsafe {
+            self.set_encoder_params(quality, state_idx)?;
+            let pfn = self
+                .lib
+                .nvjpeg_encode_image()
+                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegEncodeImage: {e}")))?;
+            check(pfn(
+                self.handle,
+                self.encoder_states[state_idx],
+                self.encoder_params[state_idx],
+                &image,
+                NVJPEG_INPUT_RGBI,
+                width as c_int,
+                height as c_int,
+                self.streams[stream_idx],
+            ))
+        }
+    }
+
+    /// Enqueue a bitstream size query for one encoder state on its stream.
+    unsafe fn enqueue_size_query(
+        &self,
+        state_idx: usize,
+        stream_idx: usize,
+        size: &mut usize,
+    ) -> Result<(), TranscodeError> {
+        let pfn = self.lib.nvjpeg_encode_retrieve_bitstream().map_err(|e| {
+            TranscodeError::Unavailable(format!("nvjpegEncodeRetrieveBitstream: {e}"))
+        })?;
+        check(unsafe {
+            pfn(
+                self.handle,
+                self.encoder_states[state_idx],
                 ptr::null_mut(),
-                &mut needed,
-                self.stream,
+                size,
+                self.streams[stream_idx],
+            )
+        })
+    }
+
+    /// Enqueue a bitstream copy from one encoder state into a host buffer
+    /// on its stream (async; read only after the stream is synchronized).
+    unsafe fn enqueue_bitstream_copy(
+        &self,
+        state_idx: usize,
+        stream_idx: usize,
+        dst: *mut u8,
+        size: &mut usize,
+    ) -> Result<(), TranscodeError> {
+        let pfn = self.lib.nvjpeg_encode_retrieve_bitstream().map_err(|e| {
+            TranscodeError::Unavailable(format!("nvjpegEncodeRetrieveBitstream: {e}"))
+        })?;
+        check(unsafe {
+            pfn(
+                self.handle,
+                self.encoder_states[state_idx],
+                dst,
+                size,
+                self.streams[stream_idx],
+            )
+        })
+    }
+
+    /// Reusable pinned output buffer for batch slot `idx`, grown as needed.
+    fn pinned_buf(&mut self, idx: usize, needed: usize) -> &mut HostBuf {
+        if self.pinned.len() <= idx {
+            self.pinned.resize_with(idx + 1, || HostBuf::new(0));
+            self.pinned_cap.resize(idx + 1, 0);
+        }
+        if self.pinned_cap[idx] < needed {
+            self.pinned[idx] = HostBuf::new(needed);
+            self.pinned_cap[idx] = needed;
+        }
+        &mut self.pinned[idx]
+    }
+
+    /// Route one job through the per-image path: host RGBI decode + RGB
+    /// encode (odd subsamplings, raw RGB streams, anything the device path
+    /// rejected). Uses slot 0's stream and the dedicated fallback encoder
+    /// state, so it never collides with an in-flight batch.
+    fn process_single(&mut self, jobs: &mut [Job], idx: usize) {
+        const SINGLE: usize = BATCH_MAX; // dedicated encoder slot
+        let result = unsafe { self.transcode_single(&jobs[idx].input, jobs[idx].quality, SINGLE) };
+        let _ = jobs[idx].reply.send(result);
+    }
+
+    /// Per-image transcode: host RGBI decode + RGB encode.
+    unsafe fn transcode_single(
+        &mut self,
+        input: &JobInput,
+        quality: u8,
+        state: usize,
+    ) -> Result<Vec<u8>, TranscodeError> {
+        match input {
+            JobInput::Jpeg(bytes) => {
+                // Grayscale should already be filtered upstream; never let a
+                // 1-component JPEG through (a 3-component output would
+                // corrupt a /DeviceGray stream).
+                if jpeg_components(bytes) == Some(1) {
+                    return Err(TranscodeError::Encode(
+                        "nvJPEG has no single-channel input format; the CPU backend \
+                         handles /DeviceGray streams"
+                            .into(),
+                    ));
+                }
+                let (w, h, _, _) = unsafe { self.image_info(bytes) }?;
+                let mut buf = unsafe { self.decode_to_host(bytes, w as usize, h as usize) }?;
+                unsafe {
+                    self.enqueue_encode_rgb(
+                        w,
+                        h,
+                        buf.as_mut_ptr(),
+                        (w as usize) * 3,
+                        quality,
+                        state,
+                        0,
+                    )?
+                };
+                unsafe { self.retrieve_state(state) }
+            }
+            JobInput::Rgb {
+                width,
+                height,
+                bytes,
+            } => {
+                unsafe {
+                    self.enqueue_encode_rgb(
+                        *width,
+                        *height,
+                        bytes.as_ptr() as *mut _,
+                        (*width as usize) * 3,
+                        quality,
+                        state,
+                        0,
+                    )?
+                };
+                unsafe { self.retrieve_state(state) }
+            }
+        }
+    }
+
+    /// Enqueue a single-image decode to a pinned host buffer (interleaved
+    /// RGB). Used for the per-image fallback path.
+    unsafe fn decode_to_host(
+        &self,
+        data: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<HostBuf, TranscodeError> {
+        let mut buf = HostBuf::new(width * height * 3);
+        let mut image = nvjpeg::nvjpegImage_t {
+            channel: [
+                buf.as_mut_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ],
+            pitch: [width * 3, 0, 0, 0],
+        };
+        let pfn = self
+            .lib
+            .nvjpeg_decode()
+            .map_err(|e| TranscodeError::Unavailable(format!("nvjpegDecode: {e}")))?;
+        check(unsafe {
+            pfn(
+                self.handle,
+                self.decode_states[0],
+                data.as_ptr(),
+                data.len(),
+                nvjpeg::nvjpegOutputFormat_t::Rgbi,
+                &mut image,
+                self.streams[0],
             )
         })?;
-        unsafe { sync_stream(self.stream)? };
-        if needed == 0 {
+        Ok(buf)
+    }
+
+    /// Query, sync, copy, sync for one encoder state on slot 0's stream
+    /// (per-image path).
+    unsafe fn retrieve_state(&mut self, state_idx: usize) -> Result<Vec<u8>, TranscodeError> {
+        let mut size = 0usize;
+        unsafe { self.enqueue_size_query(state_idx, 0, &mut size) }?;
+        unsafe { sync_stream(self.streams[0]) }?;
+        if size == 0 {
             return Err(TranscodeError::Encode(
                 "nvjpeg produced an empty bitstream".into(),
             ));
         }
+        let dst = self.pinned_buf(0, size).as_mut_ptr();
+        let mut len = size;
+        unsafe { self.enqueue_bitstream_copy(state_idx, 0, dst, &mut len) }?;
+        unsafe { sync_stream(self.streams[0]) }?;
+        let out = self.pinned_buf(0, len.min(size)).as_slice()[..len.min(size)].to_vec();
+        Ok(out)
+    }
 
-        let mut out = HostBuf::new(needed);
-        let mut len = needed;
-        check(unsafe {
-            pfn(
-                self.handle,
-                self.encoder_state,
-                out.as_mut_ptr(),
-                &mut len,
-                self.stream,
-            )
-        })?;
-        unsafe { sync_stream(self.stream)? };
-        Ok(out.as_slice()[..len.min(needed)].to_vec())
+    /// Process one batch: fan the images out across the per-slot streams,
+    /// each decoding to device memory and re-encoding from it, then one
+    /// query/copy round per slot. Falls back per-image on any failure so a
+    /// single bad stream never drags the whole batch to the CPU path.
+    fn process_chunk(&mut self, jobs: &mut [Job], chunk: &[(usize, u32, u32, c_int)]) {
+        if self.run_chunk(jobs, chunk).is_err() {
+            let _ = unsafe { sync_stream(self.streams[0]) };
+            for &(idx, ..) in chunk {
+                self.process_single(jobs, idx);
+            }
+        }
+    }
+
+    fn run_chunk(
+        &mut self,
+        jobs: &mut [Job],
+        chunk: &[(usize, u32, u32, c_int)],
+    ) -> Result<(), TranscodeError> {
+        let n = chunk.len();
+        let quality = jobs[chunk[0].0].quality;
+
+        unsafe {
+            // Device YUV buffers + the per-slot decode/encode chains. The
+            // JPEG bytes stay on the host; nvjpegDecode reads them and
+            // writes the decoded YUV straight to device memory.
+            let mut devs: Vec<DeviceBuf> = Vec::with_capacity(n);
+            let mut sizes = vec![0usize; n];
+            for (k, &(idx, w, h, sub)) in chunk.iter().enumerate() {
+                let JobInput::Jpeg(bytes) = &jobs[idx].input else {
+                    continue;
+                };
+                let (_, _, _, len) = yuv_geometry(w as usize, h as usize, sub);
+                let dev = self.alloc_device(len, self.streams[k])?;
+                self.enqueue_decode_to_device(bytes, w as usize, h as usize, sub, &dev, k)?;
+                self.enqueue_encode_yuv(w, h, sub, &dev, quality, k, k)?;
+                self.enqueue_size_query(k, k, &mut sizes[k])?;
+                devs.push(dev);
+            }
+            let n = devs.len();
+            if n == 0 {
+                return Ok(());
+            }
+
+            // First sync: every slot's decode + encode + size query has
+            // completed, so the sizes are valid.
+            for k in 0..n {
+                sync_stream(self.streams[k])?;
+            }
+
+            // Copy the bitstreams out (pinned pool), then one more sync.
+            for (k, size) in sizes.iter_mut().enumerate() {
+                let dst = self.pinned_buf(k, *size).as_mut_ptr();
+                self.enqueue_bitstream_copy(k, k, dst, size)?;
+            }
+            for k in 0..n {
+                sync_stream(self.streams[k])?;
+            }
+
+            for (k, &(idx, _, _, _)) in chunk.iter().enumerate() {
+                let out = self.pinned_buf(k, sizes[k]).as_slice()[..sizes[k]].to_vec();
+                let _ = jobs[idx].reply.send(Ok(out));
+            }
+            // `devs` drop here: every stream has drained, so the device
+            // buffers are free to return to the pool.
+            Ok(())
+        }
+    }
+
+    /// Classify the batch and dispatch: YUV-capable JPEGs (3 components,
+    /// 4:2:0/4:2:2/4:4:4) through the device path; everything else through
+    /// the per-image path.
+    fn process(&mut self, jobs: &mut [Job]) {
+        let mut yuv: Vec<(usize, u32, u32, c_int)> = Vec::new();
+        let mut single: Vec<usize> = Vec::new();
+        for (i, job) in jobs.iter().enumerate() {
+            match &job.input {
+                JobInput::Jpeg(bytes) => match unsafe { self.image_info(bytes) } {
+                    Ok((w, h, sub, ncomp))
+                        if ncomp == 3 && matches!(sub, CSS_420 | CSS_422 | CSS_444) =>
+                    {
+                        yuv.push((i, w, h, sub))
+                    }
+                    _ => single.push(i),
+                },
+                JobInput::Rgb { .. } => single.push(i),
+            }
+        }
+        for chunk in yuv_chunks(&yuv) {
+            self.process_chunk(jobs, chunk);
+        }
+        for &i in &single {
+            self.process_single(jobs, i);
+        }
     }
 }
 
-/// NVIDIA nvJPEG transcoder.
-///
-/// Holds a pool of independent [`Inner`] handles, each with its own CUDA
-/// stream: every rayon worker pops one for the duration of a call, so many
-/// streams transcode on the GPU concurrently without ever touching another
-/// worker's handle. The pool grows lazily up to the number of concurrent
-/// callers.
+/// NVIDIA nvJPEG transcoder: an mpsc queue into the GPU consumer thread.
+/// `transcode_image` enqueues one job and blocks for its result, so the
+/// rayon producers stay lock-free and the consumer batches work for the
+/// GPU. The thread is detached: like the CUDA teardown, it is left to the
+/// OS to reclaim at process exit.
 #[derive(Debug)]
 pub struct CudaTranscoder {
-    pool: Mutex<Vec<Inner>>,
+    tx: Sender<Job>,
 }
 
 impl CudaTranscoder {
-    /// Create the pool, pre-warming one handle so the first stream does not
-    /// pay the full CUDA context-init latency. Fails (as
-    /// [`TranscodeError::Unavailable`]) when the library or driver is not
-    /// present; callers fall back to the CPU backend.
+    /// Probe the library cheaply (dlopen only — no CUDA context yet), so
+    /// `--acceleration auto` keeps its semantics, then start the consumer
+    /// thread. The ~100 ms context init happens there, off the calling
+    /// thread, overlapping the PDF parse.
     pub fn new() -> Result<Self, TranscodeError> {
-        Ok(Self {
-            pool: Mutex::new(vec![Inner::new()?]),
-        })
+        nvjpeg::nvjpeg()
+            .map_err(|e| TranscodeError::Unavailable(format!("nvJPEG library: {e}")))?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("presse-gpu".into())
+            .spawn(move || consumer_main(rx))
+            .map_err(|e| TranscodeError::Unavailable(format!("spawn GPU consumer: {e}")))?;
+        Ok(Self { tx })
+    }
+}
+
+fn consumer_main(rx: Receiver<Job>) {
+    // Initialize the CUDA context + nvjpeg state *before* waiting for jobs:
+    // this is the ~100 ms one-shot cost, and doing it here lets it overlap
+    // the PDF load/parse on the calling thread. On failure, every queued
+    // job is answered with the error and the caller's FallbackTranscoder
+    // routes each stream to the CPU backend.
+    let mut gpu = match GpuState::new() {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            while let Ok(job) = rx.recv() {
+                let _ = job.reply.send(Err(e.clone()));
+            }
+            return;
+        }
+    };
+    while let Ok(first) = rx.recv() {
+        let mut batch = Vec::with_capacity(BATCH_MAX);
+        batch.push(first);
+        while batch.len() < BATCH_MAX {
+            match rx.recv_timeout(COALESCE_TIMEOUT) {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        gpu.process(&mut batch);
     }
 }
 
 impl ImageTranscoder for CudaTranscoder {
     fn transcode_image(&self, input: &Input, quality: u8) -> Result<Vec<u8>, TranscodeError> {
-        // Check the stream class cheaply before touching the pool so a
-        // grayscale stream never borrows a handle (it will be re-routed to
-        // the CPU backend anyway).
-        if matches!(
-            input,
-            Input::Jpeg(b) if jpeg_components(b) == Some(1)
-        ) || matches!(input, Input::Pixels(ImageRef::Luma8 { .. }))
+        // Route grayscale away before it reaches the GPU: nvJPEG has no
+        // single-channel input format, and a 3-component JPEG written into
+        // a /DeviceGray stream renders as washed-out garbage.
+        if matches!(input, Input::Jpeg(b) if jpeg_components(b) == Some(1))
+            || matches!(input, Input::Pixels(ImageRef::Luma8 { .. }))
         {
             return Err(TranscodeError::Encode(
                 "nvJPEG has no single-channel input format; the CPU backend handles \
@@ -589,16 +981,29 @@ impl ImageTranscoder for CudaTranscoder {
             ));
         }
 
-        // Take an idle handle (or create one — serialized under the pool
-        // lock, so at most one is created per lock acquisition). The handle
-        // is returned before the Result is inspected, so the pool never
-        // leaks handles on error paths.
-        let inner = match self.pool.lock().unwrap().pop() {
-            Some(inner) => inner,
-            None => Inner::new()?,
+        let job_input = match input {
+            Input::Jpeg(bytes) => JobInput::Jpeg(bytes.to_vec()),
+            Input::Pixels(ImageRef::Rgb8 {
+                width,
+                height,
+                bytes,
+            }) => JobInput::Rgb {
+                width: *width,
+                height: *height,
+                bytes: bytes.to_vec(),
+            },
+            Input::Pixels(ImageRef::Luma8 { .. }) => unreachable!("guarded above"),
         };
-        let result = inner.transcode(input, quality);
-        self.pool.lock().unwrap().push(inner);
-        result
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Job {
+                input: job_input,
+                quality,
+                reply: reply_tx,
+            })
+            .map_err(|_| TranscodeError::Unavailable("GPU consumer is gone".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| TranscodeError::Unavailable("GPU consumer is gone".into()))?
     }
 }

@@ -13,9 +13,10 @@
 //! corrupt a stream.
 //!
 //! **Hardware note:** the `cuda` backend was exercised on an NVIDIA RTX 4080
-//! SUPER with CUDA 13.3 (decode + encode, including the runtime fallback
-//! path); the `rocm` backend is compile-tested only. Neither backend runs in
-//! CI — validate on real hardware before relying on GPU acceleration in
+//! SUPER with CUDA 13.3 (batched decode to device memory with the hardware
+//! decoder, per-image encode from device memory, runtime fallback paths);
+//! the `rocm` backend is compile-tested only. Neither backend runs in CI —
+//! validate on real hardware before relying on GPU acceleration in
 //! production.
 
 use std::fmt;
@@ -65,7 +66,7 @@ pub enum Input<'a> {
 /// caller decides whether to skip the stream or retry on another backend.
 // `Encode`/`Unavailable`/`Gpu` are produced only by the feature-gated backends.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TranscodeError {
     /// The input could not be decoded.
     Decode(String),
