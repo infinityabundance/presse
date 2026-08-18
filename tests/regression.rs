@@ -52,6 +52,28 @@ fn qpdf_available() -> bool {
     Command::new("qpdf").arg("--version").output().is_ok()
 }
 
+/// CI convention shared with `ci/validate_corpus.py`: when
+/// `PRESSE_REQUIRE_PDF_TOOLS` is set, a missing validator is a hard test
+/// failure instead of a silent skip, so a broken runner image cannot quietly
+/// degrade the suite. Locally (unset) the gates degrade with a loud warning.
+fn require_pdf_tools() -> bool {
+    std::env::var_os("PRESSE_REQUIRE_PDF_TOOLS").is_some_and(|v| !v.is_empty())
+}
+
+/// Assert that an external validator is present, or fail/skip per
+/// [`require_pdf_tools`].
+fn ensure_tool(name: &str, available: bool) -> bool {
+    if available {
+        return true;
+    }
+    let msg = format!("{name} not found — skipping the {name} validity gate");
+    if require_pdf_tools() {
+        panic!("{msg}; set PRESSE_REQUIRE_PDF_TOOLS=0 to skip locally");
+    }
+    eprintln!("note: {msg}");
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic pixel generators
 // ---------------------------------------------------------------------------
@@ -350,7 +372,7 @@ fn assert_well_formed(path: &Path) -> Document {
         }
     }
 
-    if gs_available() {
+    if ensure_tool("gs", gs_available()) {
         let status = Command::new("gs")
             .args(["-sDEVICE=nullpage", "-dNOPAUSE", "-dBATCH", "-dQUIET"])
             .arg(path)
@@ -364,7 +386,7 @@ fn assert_well_formed(path: &Path) -> Document {
     }
 
     // qpdf is the strictest syntax gate: it validates every xref entry.
-    if qpdf_available() {
+    if ensure_tool("qpdf", qpdf_available()) {
         let output = Command::new("qpdf").args(["--check"]).arg(path).output();
         if let Ok(output) = output {
             let text = format!(
@@ -423,8 +445,7 @@ fn ssim(a: &GrayImage, b: &GrayImage) -> f64 {
 /// Rasterize pre/post versions of `name` and assert the pages are visually
 /// equivalent (SSIM above `threshold`). Returns early when poppler is absent.
 fn assert_visual_similarity(dir: &Path, name: &str, threshold: f64) {
-    if !pdftoppm_available() {
-        eprintln!("note: pdftoppm not found — skipping visual check for {name}");
+    if !ensure_tool("pdftoppm", pdftoppm_available()) {
         return;
     }
     let (pre_pdf, post_pdf) = (

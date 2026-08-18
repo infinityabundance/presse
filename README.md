@@ -15,7 +15,7 @@ A fast command-line tool for PDF manipulation written in Rust.
 **Compress and merge** PDF files naturally and easily with this ready-to-use command line tool.
 **Convert images** of any format into ready-to-use pdfs.
 
-**7x faster** than ghostscript with **better** compression. Benchmarked against ghostscript on 19 PDFs.
+**~7× faster** than ghostscript (median, per-document on a 100-PDF corpus) and **~2× faster than single-threaded** rayon. Benchmarked in [`benches/docker/RESULTS.md`](benches/docker/RESULTS.md) — the headline figure is a median; best case is much higher, mean is lower.
 
 ## Features
 
@@ -50,16 +50,26 @@ cargo install presse
 
 ## Benchmark
 
-Measured over 19 real-world PDFs, comparing `presse press --quality 50` against Ghostscript `/ebook`.
+Measured over 100 public real-world PDFs (≈300 MB, 5,268 pages), comparing
+`presse press --quality 50` against Ghostscript `/ebook`. Full methodology,
+per-document data, and correctness gates in
+[`benches/docker/RESULTS.md`](benches/docker/RESULTS.md).
 
-| | presse | ghostscript |
-|---|---|---|
-| Mean execution time | **0.135s** | 0.927s |
-| Mean size reduction | **+19.2%** | -10.2% |
+| | presse (rayon) | presse (serial) | ghostscript `/ebook` |
+|---|---|---|---|
+| Total wall time (100 PDFs) | **81 s** | 123 s | 319 s |
+| Mean per document | **0.81 s** | 1.23 s | 3.22 s |
+| Mean size reduction | 19.5 % | 19.5 % | 60.5 % |
 
-Presse is **~7× faster** and compresses more effectively on this corpus. Ghostscript's `/ebook` preset can inflate already-optimised documents by downsampling images that are below its target DPI.
+- **Parallel vs single-threaded**: 2.2× mean, 1.5× median. Best case ~6× on
+  an image-heavy PDF (24 images, 16 cores) — the headline speedup of the
+  rayon pipeline.
+- **Parallel vs ghostscript**: ~7× median per document, ~4× total wall time.
+- **Size**: presse reduces output without touching image resolution;
+  ghostscript's `/ebook` downsamples images, so it shrinks files more but
+  changes their resolution. Both figures are means over the corpus.
 
-Image re-encoding is **parallelized with [rayon](https://github.com/rayon-rs/rayon)** across all available CPU threads — on a 16-core machine a 24-image PDF compresses ~6× faster than single-threaded. A reproducible containerized benchmark harness lives in [`benches/docker/`](benches/docker/):
+A reproducible containerized benchmark harness lives in [`benches/docker/`](benches/docker/):
 
 ```bash
 docker build -t presse-bench -f benches/docker/Dockerfile.bench .

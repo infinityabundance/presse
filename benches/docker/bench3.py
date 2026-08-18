@@ -4,7 +4,7 @@
   vs ghostscript /ebook. Appends one CSV row per PDF so progress survives
   interruption.
 
-Usage: bench3.py <in-dir> <out-csv> [presse-bin] [gs-args...]
+Usage: bench3.py <in-dir> <out-csv> <presse-bin> [gs-args...]
 """
 import csv
 import os
@@ -13,9 +13,12 @@ import sys
 import time
 from pathlib import Path
 
+if len(sys.argv) < 4:
+    sys.exit("usage: bench3.py <in-dir> <out-csv> <presse-bin> [gs-args...]")
+
 IN = Path(sys.argv[1])
 CSV = Path(sys.argv[2])
-PRESSE = sys.argv[3] if len(sys.argv) > 3 else "/run/media/one/1tb_kingston1/presse/target/release/presse"
+PRESSE = sys.argv[3]
 QUALITY = "50"
 
 pdfs = sorted(IN.glob("*.pdf"))
