@@ -3,6 +3,13 @@ mod macros;
 mod cli;
 mod pdf;
 
+// Rayon workers constantly allocate and drop temporary buffers during image
+// transcoding; mimalloc has per-thread caches that avoid contention on the
+// system allocator. Skipped on musl, where mimalloc-sys has no toolchain.
+#[cfg(not(target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use pdf::builder::image_to_pdf;
 use pdf::images::compress_images;
 use pdf::merger::merge;

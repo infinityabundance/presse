@@ -2,12 +2,72 @@ use image::DynamicImage;
 use image::codecs::jpeg::JpegEncoder;
 use lopdf::{Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
+
+use ahash::AHasher;
 
 /// Fixed-size block used for raw pixel buffer processing.
 /// 32 KiB keeps the working set inside the L1/L2 caches (and aligned with
 /// 4-byte pixels), so multi-MB scans are walked in cache-resident slices
 /// instead of one long linear sweep.
 const CHUNK_SIZE: usize = 32 * 1024;
+
+/// Cache of re-encoded JPEG buffers, keyed by a hash of the exact pixels fed
+/// to the encoder plus the target quality. PDFs embed identical images
+/// (logos, watermarks, headers) dozens of times across separate object ids;
+/// one encode serves every copy. On a miss the encoder runs *outside* the
+/// lock, so parallel workers never serialize behind the cache.
+struct ReencodeCache {
+    map: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+}
+
+impl ReencodeCache {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the cached buffer for `key`, or produce it with `encode` and
+    /// cache it. An empty buffer means "could not encode" and is cached too,
+    /// so every duplicate skips identically.
+    fn get(&self, key: u64, encode: impl FnOnce() -> Vec<u8>) -> Arc<Vec<u8>> {
+        if let Some(buf) = self.map.lock().unwrap().get(&key) {
+            return Arc::clone(buf);
+        }
+        let buf = Arc::new(encode());
+        self.map
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&buf));
+        buf
+    }
+}
+
+/// Key for the re-encode cache: target quality + the exact pixel bytes the
+/// JPEG encoder will see (channel count tags luma vs rgb payloads).
+fn encode_key(quality: u8, img: &DynamicImage) -> u64 {
+    let mut h = AHasher::default();
+    h.write_u8(quality);
+    match img {
+        DynamicImage::ImageLuma8(g) => {
+            h.write_u8(1);
+            g.as_raw().hash(&mut h);
+        }
+        DynamicImage::ImageRgb8(g) => {
+            h.write_u8(3);
+            g.as_raw().hash(&mut h);
+        }
+        other => {
+            h.write_u8(0);
+            other.as_bytes().hash(&mut h);
+        }
+    }
+    h.finish()
+}
 
 /// Replace JPEG images in a document by a compressed version to the given quality.
 /// Only JPEG images are replaced, the other are skipped.
@@ -41,10 +101,17 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 
     verbose!(verbose, "[images] Found {} image object(s)", images.len());
 
+    // Deduplication cache: identical images (logos, watermarks, headers)
+    // appear dozens of times in real PDFs; encode each unique image once.
+    let cache = ReencodeCache::new();
+
     // Phase 2 — re-encode in parallel (pure, lock-free).
     let reencoded: Vec<(ObjectId, Stream)> = images
         .into_par_iter()
-        .map(|(id, stream)| (id, reencode_image_stream(id, stream, quality, verbose)))
+        .map(|(id, stream)| {
+            let stream = reencode_image_stream(id, stream, quality, verbose, &cache);
+            (id, stream)
+        })
         .collect();
 
     // Phase 3 — single mutation pass back onto the document.
@@ -59,7 +126,13 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 /// Returns the stream that should be stored back: the original, untouched,
 /// when nothing could or should be re-encoded; a modified copy carrying the
 /// new JPEG payload and updated `/Filter` + `/Length` entries otherwise.
-fn reencode_image_stream(id: ObjectId, mut stream: Stream, quality: u8, verbose: bool) -> Stream {
+fn reencode_image_stream(
+    id: ObjectId,
+    mut stream: Stream,
+    quality: u8,
+    verbose: bool,
+    cache: &ReencodeCache,
+) -> Stream {
     let color_space_raw = stream
         .dict
         .get(b"ColorSpace")
@@ -135,10 +208,7 @@ fn reencode_image_stream(id: ObjectId, mut stream: Stream, quality: u8, verbose:
         _ => None,
     };
 
-    let mut buf: Vec<u8> = Vec::new();
-    let cursor = std::io::Cursor::new(&mut buf);
-
-    match filter {
+    let buf: Vec<u8> = match filter {
         Some(b"DCTDecode") | Some(b"JPXDecode") => {
             verbose!(
                 verbose,
@@ -157,7 +227,15 @@ fn reencode_image_stream(id: ObjectId, mut stream: Stream, quality: u8, verbose:
                     return stream;
                 }
             };
-            encode_jpeg(cursor, &img, quality);
+            // Identical JPEG bytes re-encode identically: encode once, reuse
+            // the cached buffer for every duplicate image object.
+            let key = encode_key(quality, &img);
+            let buf = cache.get(key, || {
+                let mut out = Vec::new();
+                encode_jpeg(&mut out, &img, quality);
+                out
+            });
+            buf.as_ref().clone()
         }
         Some(other_filter) => {
             verbose!(
@@ -198,7 +276,15 @@ fn reencode_image_stream(id: ObjectId, mut stream: Stream, quality: u8, verbose:
                     return stream;
                 }
             };
-            encode_jpeg(cursor, &img, quality);
+            // Same pixels → same JPEG, regardless of how the source stream
+            // happened to be compressed.
+            let key = encode_key(quality, &img);
+            let buf = cache.get(key, || {
+                let mut out = Vec::new();
+                encode_jpeg(&mut out, &img, quality);
+                out
+            });
+            buf.as_ref().clone()
         }
         None => {
             verbose!(
@@ -208,7 +294,7 @@ fn reencode_image_stream(id: ObjectId, mut stream: Stream, quality: u8, verbose:
             );
             return stream;
         }
-    }
+    };
 
     if buf.is_empty() {
         verbose!(
@@ -253,8 +339,8 @@ fn reencode_image_stream(id: ObjectId, mut stream: Stream, quality: u8, verbose:
 /// Luma8 payload would be written as a 3-component JPEG — invalid inside a
 /// `/DeviceGray` stream and rendered as washed-out garbage by viewers.
 /// Encoding the concrete `GrayImage` keeps the JPEG at a single component.
-fn encode_jpeg(cursor: std::io::Cursor<&mut Vec<u8>>, img: &DynamicImage, quality: u8) {
-    let mut encoder = JpegEncoder::new_with_quality(cursor, quality);
+fn encode_jpeg(out: &mut Vec<u8>, img: &DynamicImage, quality: u8) {
+    let mut encoder = JpegEncoder::new_with_quality(std::io::Cursor::new(out), quality);
     match img {
         DynamicImage::ImageLuma8(gray) => {
             let _ = encoder.encode_image(gray);

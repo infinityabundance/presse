@@ -20,6 +20,7 @@ A fast command-line tool for PDF manipulation written in Rust.
 ## Features
 
 - **Image recompression** — re-encodes images at a target quality, skipping CMYK images
+- **Engine optimizations** — rayon-parallel re-encoding, mimalloc allocator, zlib-rs deflate backend, memory-mapped reads, deduplicated identical image streams
 - **Structural compression** — object stream packing, xref stream compression
 - **Batch processing** — compress multiple files in one command via shell wildcards
 - **Smart output paths** — sensible defaults, explicit naming, or output to a directory

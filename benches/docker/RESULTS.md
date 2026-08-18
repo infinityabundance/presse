@@ -3,6 +3,14 @@
 Measured on a 16-core machine with the release build
 (`RUSTFLAGS="-C target-cpu=native"`), `presse press -q 50`.
 
+## Performance work
+
+The engine uses: rayon for concurrent image re-encoding, `mimalloc` as the
+global allocator (skipped on musl), the `zlib-rs` deflate backend for
+flate2 (pure Rust), memory-mapped input reads, and a re-encode cache that
+deduplicates identical image streams (hashed pixel input; one JPEG encode
+serves every duplicate).
+
 ## Corpus
 
 100 public real-world PDFs (≈300 MB, 5,268 pages):
@@ -29,12 +37,19 @@ Reproduce the corpus with `benches/docker/fetch_batch.sh` and a sparse clone of
 
 | tool | mean | median | total (100 PDFs) |
 |---|---|---|---|
-| presse parallel (rayon) | 1.06 s | 16 ms | 106 s |
-| presse serial (1 thread) | 1.52 s | 40 ms | 152 s |
+| presse parallel (rayon) | 0.81 s | 16 ms | 81 s |
+| presse serial (1 thread) | 1.23 s | 34 ms | 123 s |
 | ghostscript /ebook | 3.22 s | 144 ms | 319 s |
 
-Parallel vs serial: **mean 2.45×, median 1.57×** — ghostscript: **mean 177×,
-median 7.6×** (total wall time 3× faster than gs).
+Parallel vs serial: **mean 2.2×, median 1.5×** — ghostscript: **mean 98×,
+median 6.9×** (total wall time ~4× faster than gs).
+
+The allocator / deflate-backend / mmap / dedup changes cut presse wall time
+by **24% parallel / 19% serial** vs the previous build (mean 1.06 → 0.81 s
+parallel; total 106 → 81 s). Largest single-doc wins are flate-heavy
+workloads (IRS 1040 instructions 1.5×, the 1310-page PDF 1.4 reference
+1.4×, Unicode 15.0 1.4× — zlib-rs) and duplicate-heavy papers (cycleGAN
+1.1×, 41% duplicate images in GPT-3 — dedup).
 
 Speedup scales with image count (the parallelized phase):
 
