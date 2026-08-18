@@ -11,9 +11,10 @@
 //! `nvjpegDecode` API; the encode path uses `nvjpegEncodeImage` +
 //! `nvjpegEncodeRetrieveBitstream` with interleaved RGB input. nvJPEG has no
 //! single-channel input format, so `/DeviceGray` streams are routed back to
-//! the CPU backend. nvJPEG states are not thread-safe, so the handle is
-//! serialized behind a mutex; CUDA-stream parallelism is left as a future
-//! optimization.
+//! the CPU backend. nvJPEG states are not thread-safe, so [`CudaTranscoder`]
+//! keeps a pool of independent handles that rayon workers borrow for the
+//! duration of each stream — many streams transcode concurrently on the GPU,
+//! one handle per active worker.
 //!
 //! **Validation status:** decode + encode were exercised on NVIDIA hardware
 //! (RTX 4080 SUPER, CUDA 13.3). Fresh encoder params reject
@@ -57,9 +58,9 @@ struct Inner {
     encoder_params: nvjpeg::nvjpegEncoderParams_t,
 }
 
-// SAFETY: every field is only dereferenced inside `CudaTranscoder.inner`, a
-// mutex, so the raw handles are never touched concurrently — mirroring how
-// the C library expects to be used.
+// SAFETY: every field is only dereferenced while the handle is borrowed
+// from `CudaTranscoder`'s pool, so no raw handle is ever touched by two
+// threads at once — mirroring how the C library expects to be used.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -74,6 +75,103 @@ impl Drop for Inner {
 }
 
 impl Inner {
+    /// Create one nvjpeg handle with decode state, encoder state, and encoder
+    /// parameters. Fails (as [`TranscodeError::Unavailable`]) when the
+    /// library or driver is not present; callers fall back to the CPU backend.
+    fn new() -> Result<Self, TranscodeError> {
+        let lib = nvjpeg::nvjpeg()
+            .map_err(|e| TranscodeError::Unavailable(format!("nvJPEG library: {e}")))?;
+
+        unsafe {
+            let mut handle = ptr::null_mut();
+            let pfn = lib
+                .nvjpeg_create_simple()
+                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegCreateSimple: {e}")))?;
+            check(pfn(&mut handle))?;
+
+            let mut state = ptr::null_mut();
+            let pfn = lib
+                .nvjpeg_jpeg_state_create()
+                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegJpegStateCreate: {e}")))?;
+            if let Err(e) = check(pfn(handle, &mut state)) {
+                if let Ok(destroy) = lib.nvjpeg_destroy() {
+                    let _ = destroy(handle);
+                }
+                return Err(e);
+            }
+
+            let mut encoder_state = ptr::null_mut();
+            let pfn = lib.nvjpeg_encoder_state_create().map_err(|e| {
+                TranscodeError::Unavailable(format!("nvjpegEncoderStateCreate: {e}"))
+            })?;
+            if let Err(e) = check(pfn(handle, &mut encoder_state, ptr::null_mut())) {
+                if let Ok(destroy) = lib.nvjpeg_jpeg_state_destroy() {
+                    let _ = destroy(state);
+                }
+                if let Ok(destroy) = lib.nvjpeg_destroy() {
+                    let _ = destroy(handle);
+                }
+                return Err(e);
+            }
+
+            let mut encoder_params = ptr::null_mut();
+            let pfn = lib.nvjpeg_encoder_params_create().map_err(|e| {
+                TranscodeError::Unavailable(format!("nvjpegEncoderParamsCreate: {e}"))
+            })?;
+            if let Err(e) = check(pfn(handle, &mut encoder_params, ptr::null_mut())) {
+                if let Ok(destroy) = lib.nvjpeg_encoder_state_destroy() {
+                    let _ = destroy(encoder_state);
+                }
+                if let Ok(destroy) = lib.nvjpeg_jpeg_state_destroy() {
+                    let _ = destroy(state);
+                }
+                if let Ok(destroy) = lib.nvjpeg_destroy() {
+                    let _ = destroy(handle);
+                }
+                return Err(e);
+            }
+
+            Ok(Self {
+                lib,
+                handle,
+                state,
+                encoder_state,
+                encoder_params,
+            })
+        }
+    }
+
+    /// Transcode one stream with this handle. nvjpeg objects are not safe for
+    /// concurrent use, so a handle is only ever used by one thread at a time
+    /// (see [`CudaTranscoder`]'s pool).
+    fn transcode(&self, input: &Input, quality: u8) -> Result<Vec<u8>, TranscodeError> {
+        unsafe {
+            match input {
+                Input::Jpeg(bytes) => {
+                    if jpeg_components(bytes) == Some(1) {
+                        return Err(TranscodeError::Encode(
+                            "nvJPEG has no single-channel input format; the CPU backend \
+                             preserves /DeviceGray JPEGs"
+                                .into(),
+                        ));
+                    }
+                    let (w, h, rgb) = self.decode(bytes)?;
+                    self.encode(w, h, &rgb, (w * 3) as usize, quality)
+                }
+                Input::Pixels(ImageRef::Luma8 { .. }) => Err(TranscodeError::Encode(
+                    "nvJPEG has no single-channel input format; the CPU backend encodes \
+                     /DeviceGray streams"
+                        .into(),
+                )),
+                Input::Pixels(ImageRef::Rgb8 {
+                    width,
+                    height,
+                    bytes,
+                }) => self.encode(*width, *height, bytes, (*width * 3) as usize, quality),
+            }
+        }
+    }
+
     /// Decode a JPEG stream to interleaved RGB host memory.
     unsafe fn decode(&self, data: &[u8]) -> Result<(u32, u32, Vec<u8>), TranscodeError> {
         let mut n_components: c_int = 0;
@@ -229,108 +327,56 @@ impl Inner {
 }
 
 /// NVIDIA nvJPEG transcoder.
+///
+/// Holds a pool of independent [`Inner`] handles: each rayon worker pops one
+/// for the duration of a call, so many streams transcode on the GPU
+/// concurrently (nvJPEG handles are independent; a single handle is never
+/// shared across threads). The pool grows lazily up to the number of
+/// concurrent callers.
 #[derive(Debug)]
 pub struct CudaTranscoder {
-    inner: Mutex<Inner>,
+    pool: Mutex<Vec<Inner>>,
 }
 
 impl CudaTranscoder {
-    /// Load libnvjpeg and create the handle + states. Fails (as
+    /// Create the pool, pre-warming one handle so the first stream does not
+    /// pay the full CUDA context-init latency. Fails (as
     /// [`TranscodeError::Unavailable`]) when the library or driver is not
     /// present; callers fall back to the CPU backend.
     pub fn new() -> Result<Self, TranscodeError> {
-        let lib = nvjpeg::nvjpeg()
-            .map_err(|e| TranscodeError::Unavailable(format!("nvJPEG library: {e}")))?;
-
-        unsafe {
-            let mut handle = ptr::null_mut();
-            let pfn = lib
-                .nvjpeg_create_simple()
-                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegCreateSimple: {e}")))?;
-            check(pfn(&mut handle))?;
-
-            let mut state = ptr::null_mut();
-            let pfn = lib
-                .nvjpeg_jpeg_state_create()
-                .map_err(|e| TranscodeError::Unavailable(format!("nvjpegJpegStateCreate: {e}")))?;
-            if let Err(e) = check(pfn(handle, &mut state)) {
-                if let Ok(destroy) = lib.nvjpeg_destroy() {
-                    let _ = destroy(handle);
-                }
-                return Err(e);
-            }
-
-            let mut encoder_state = ptr::null_mut();
-            let pfn = lib.nvjpeg_encoder_state_create().map_err(|e| {
-                TranscodeError::Unavailable(format!("nvjpegEncoderStateCreate: {e}"))
-            })?;
-            if let Err(e) = check(pfn(handle, &mut encoder_state, ptr::null_mut())) {
-                if let Ok(destroy) = lib.nvjpeg_jpeg_state_destroy() {
-                    let _ = destroy(state);
-                }
-                if let Ok(destroy) = lib.nvjpeg_destroy() {
-                    let _ = destroy(handle);
-                }
-                return Err(e);
-            }
-
-            let mut encoder_params = ptr::null_mut();
-            let pfn = lib.nvjpeg_encoder_params_create().map_err(|e| {
-                TranscodeError::Unavailable(format!("nvjpegEncoderParamsCreate: {e}"))
-            })?;
-            if let Err(e) = check(pfn(handle, &mut encoder_params, ptr::null_mut())) {
-                if let Ok(destroy) = lib.nvjpeg_encoder_state_destroy() {
-                    let _ = destroy(encoder_state);
-                }
-                if let Ok(destroy) = lib.nvjpeg_jpeg_state_destroy() {
-                    let _ = destroy(state);
-                }
-                if let Ok(destroy) = lib.nvjpeg_destroy() {
-                    let _ = destroy(handle);
-                }
-                return Err(e);
-            }
-
-            Ok(Self {
-                inner: Mutex::new(Inner {
-                    lib,
-                    handle,
-                    state,
-                    encoder_state,
-                    encoder_params,
-                }),
-            })
-        }
+        Ok(Self {
+            pool: Mutex::new(vec![Inner::new()?]),
+        })
     }
 }
 
 impl ImageTranscoder for CudaTranscoder {
     fn transcode_image(&self, input: &Input, quality: u8) -> Result<Vec<u8>, TranscodeError> {
-        let inner = self.inner.lock().unwrap();
-        unsafe {
-            match input {
-                Input::Jpeg(bytes) => {
-                    if jpeg_components(bytes) == Some(1) {
-                        return Err(TranscodeError::Encode(
-                            "nvJPEG has no single-channel input format; the CPU backend \
-                             preserves /DeviceGray JPEGs"
-                                .into(),
-                        ));
-                    }
-                    let (w, h, rgb) = inner.decode(bytes)?;
-                    inner.encode(w, h, &rgb, (w * 3) as usize, quality)
-                }
-                Input::Pixels(ImageRef::Luma8 { .. }) => Err(TranscodeError::Encode(
-                    "nvJPEG has no single-channel input format; the CPU backend encodes \
-                     /DeviceGray streams"
-                        .into(),
-                )),
-                Input::Pixels(ImageRef::Rgb8 {
-                    width,
-                    height,
-                    bytes,
-                }) => inner.encode(*width, *height, bytes, (*width * 3) as usize, quality),
-            }
+        // Check the stream class cheaply before touching the pool so a
+        // grayscale stream never borrows a handle (it will be re-routed to
+        // the CPU backend anyway).
+        if matches!(
+            input,
+            Input::Jpeg(b) if jpeg_components(b) == Some(1)
+        ) || matches!(input, Input::Pixels(ImageRef::Luma8 { .. }))
+        {
+            return Err(TranscodeError::Encode(
+                "nvJPEG has no single-channel input format; the CPU backend handles \
+                 /DeviceGray streams"
+                    .into(),
+            ));
         }
+
+        // Take an idle handle (or create one — serialized under the pool
+        // lock, so at most one is created per lock acquisition). The handle
+        // is returned before the Result is inspected, so the pool never
+        // leaks handles on error paths.
+        let inner = match self.pool.lock().unwrap().pop() {
+            Some(inner) => inner,
+            None => Inner::new()?,
+        };
+        let result = inner.transcode(input, quality);
+        self.pool.lock().unwrap().push(inner);
+        result
     }
 }
