@@ -6,10 +6,15 @@ Measured on a 16-core machine with the release build
 ## Performance work
 
 The engine uses: rayon for concurrent image re-encoding, `mimalloc` as the
-global allocator (skipped on musl), the `zlib-rs` deflate backend for
-flate2 (pure Rust), memory-mapped input reads, and a re-encode cache that
-deduplicates identical image streams (hashed pixel input; one JPEG encode
-serves every duplicate).
+global allocator, the `zlib-rs` deflate backend for flate2 (pure Rust),
+memory-mapped input reads, and a re-encode cache that deduplicates identical
+image streams (hashed pixel input; one JPEG encode serves every duplicate).
+
+Build note: the figures below describe a glibc build with `mimalloc` and
+`-C target-cpu=native`. The x86_64 Linux release artifact is the musl build;
+it now ships `mimalloc` too (it builds against musl given `musl-gcc`), so the
+numbers apply to both — a native-code musl build measured within ~10% of the
+glibc build on the image-heavy corpus.
 
 ## Corpus
 

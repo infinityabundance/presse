@@ -6,8 +6,8 @@ mod transcode;
 
 // Rayon workers constantly allocate and drop temporary buffers during image
 // transcoding; mimalloc has per-thread caches that avoid contention on the
-// system allocator. Skipped on musl, where mimalloc-sys has no toolchain.
-#[cfg(not(target_env = "musl"))]
+// system allocator. It builds against musl given a musl C toolchain
+// (musl-gcc), so the release artifact gets it on every target.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

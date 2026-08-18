@@ -57,8 +57,6 @@ baracuda-cuda-sys = { version = "0.0.1-alpha.79", optional = true }
 libloading = { version = "0.8", optional = true }
 
 # Faster allocation for the many small buffers rayon workers create.
-# Not on musl: mimalloc-sys needs a C toolchain the musl target lacks.
-[target.'cfg(not(target_env = "musl"))'.dependencies]
 mimalloc = "0.1"
 
 [dev-dependencies]
