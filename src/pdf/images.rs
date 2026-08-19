@@ -1,3 +1,25 @@
+//! Image re-encoding pipeline.
+//!
+//! **Design rationale, in one place:**
+//!
+//! 1. **Three phases** — (1) detach every eligible image stream from the
+//!    `Document` into owned buffers; (2) rayon re-encodes them in parallel;
+//!    (3) results are written back in one serial pass. Workers never touch
+//!    the `Document`, so nothing in it needs a lock; the only shared
+//!    structure is the dedup cache, which synchronizes itself. Detaching
+//!    first (instead of locking per stream) is what makes the parallel
+//!    phase document-lock-free.
+//! 2. **32 KiB chunk size** (`CHUNK_SIZE`) — the one explicit fixed-size
+//!    loop is the RGBA→RGB normalization: 32 KiB keeps the working set
+//!    inside L1/L2 and, being a multiple of 4 bytes, never lets a pixel
+//!    straddle a chunk boundary.
+//! 3. **Dedup cache** — keyed by the *encoder input* (quality, kind,
+//!    dimensions, exact bytes) so identical images encode once; the map is
+//!    a `Mutex` held only for the cheap find-or-insert, and each entry is a
+//!    `OnceLock` so competing workers converge on one encode (`get_or_init`
+//!    blocks the losers). A hash alone is never treated as equality — the
+//!    key compares the actual bytes.
+
 use lopdf::{Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
 
@@ -5,12 +27,6 @@ use crate::pdf::placements::{Placements, image_placements};
 use crate::transcode::{
     CpuTranscoder, ImageRef, ImageTranscoder, Input, TranscodeCache, encode_key,
 };
-
-// Pipeline contract: (1) image streams are detached from the `Document` into
-// owned buffers; (2) rayon re-encodes them in parallel; (3) results are
-// written back in one serial pass. Worker threads never touch the `Document`
-// — they own their buffers. The only shared structure is the dedup cache
-// (internally synchronized); nothing else needs a lock.
 
 /// Fixed-size block used for raw pixel buffer processing.
 /// 32 KiB keeps the working set inside the L1/L2 caches (and aligned with
