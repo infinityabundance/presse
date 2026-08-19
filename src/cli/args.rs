@@ -32,6 +32,12 @@ pub enum Commands {
         #[arg(short, long, value_enum, default_value_t = Acceleration::Cpu)]
         acceleration: Acceleration,
 
+        /// Cap the effective resolution of placed images to DPI pixels per
+        /// inch (75 screen, 150 ebook, 300 printer, 600 prepress). Omitted:
+        /// images keep their source resolution.
+        #[arg(short = 'd', long, value_name = "DPI", value_parser = clap::value_parser!(u32).range(1..))]
+        dpi: Option<u32>,
+
         // Details during the compression process --> sizes comparison before & after
         #[arg(short, long, default_value_t = false)]
         verbose: bool,

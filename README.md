@@ -98,6 +98,9 @@ presse press *.pdf -o compressed/
 # Set JPEG quality (0–100, default 80)
 presse press document.pdf --quality 60
 
+# Cap image resolution to 150 dpi (75 screen, 150 ebook, 300 printer, 600 prepress)
+presse press document.pdf -d 150
+
 # Show size comparison after each file
 presse press document.pdf --verbose
 
@@ -118,6 +121,7 @@ presse merge *.png *.pdf
 |------|---------|-------------|
 | `-o, --output` | `<input>_compressed.pdf` | Output file or directory |
 | `-q, --quality` | `80` | Image recompression quality (0–100) |
+| `-d, --dpi` | source resolution | Cap placed image resolution to DPI pixels/inch (75 screen, 150 ebook, 300 printer, 600 prepress); omitted = keep source resolution |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 

@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             quality,
             acceleration,
+            dpi,
             verbose,
         } => {
             // Resolve the transcoding backend up front: requesting a backend
@@ -83,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                compress_images_with(&mut doc, quality, verbose, &transcoder);
+                compress_images_with(&mut doc, quality, verbose, &transcoder, dpi);
 
                 // Compressing the document
                 let output = resolve_press_path_output(file_path, &output);

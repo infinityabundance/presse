@@ -1,6 +1,7 @@
 use lopdf::{Document, Object, ObjectId, Stream};
 use rayon::prelude::*;
 
+use crate::pdf::placements::{Placements, image_placements};
 use crate::transcode::{
     CpuTranscoder, ImageRef, ImageTranscoder, Input, TranscodeCache, encode_key,
 };
@@ -11,32 +12,56 @@ use crate::transcode::{
 /// instead of one long linear sweep.
 const CHUNK_SIZE: usize = 32 * 1024;
 
+/// The `--dpi` downsampling cap: target output resolution plus the
+/// placement scan that maps every image to its drawn size (points).
+#[derive(Clone, Copy)]
+struct Downsample<'a> {
+    /// Target effective resolution in pixels per inch.
+    dpi: u32,
+    /// Placed size of every image XObject, from the content scan.
+    placements: &'a Placements,
+}
+
 /// Replace JPEG images in a document by a compressed version to the given quality.
 /// Only JPEG images are replaced, the other are skipped.
 ///
-/// Uses the default CPU backend (see [`compress_images_with`]).
+/// Uses the default CPU backend (see [`compress_images_with`]). `dpi` is
+/// `None` (or omitted) for the default behavior: images keep their source
+/// resolution.
 pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
-    compress_images_with(doc, quality, verbose, &CpuTranscoder);
+    compress_images_with(doc, quality, verbose, &CpuTranscoder, None);
 }
 
 /// Replace JPEG images in a document using the given transcoding backend.
 /// Only JPEG images are replaced, the other are skipped.
 ///
-/// The pipeline is split in three phases:
+/// `dpi`, when set, caps the effective resolution of every placed image:
+/// an image drawn at `w×h` points is downsampled to at most
+/// `w·dpi/72 × h·dpi/72` pixels (Ghostscript's `/ebook`-style behavior),
+/// and images already below the cap keep their source resolution. The
+/// pipeline is split in three phases:
 /// 1. **Extract** — detach every eligible image stream from the `Document`
 ///    object tree (serial, cheap: just map lookups + moves, no copies).
 /// 2. **Re-encode** — transcode all streams concurrently with rayon on owned,
 ///    detached buffers. No `Document` state is read or written from worker
 ///    threads, so there is nothing to lock.
 /// 3. **Apply** — write the re-encoded streams (and updated `/Filter` +
-///    `/Length` dictionary entries) back into the object tree in a single
-///    serial pass, right before serialization.
+///    `/Length`, plus `/Width` + `/Height` for downsampled images) dictionary
+///    entries back into the object tree in a single serial pass, right
+///    before serialization.
 pub fn compress_images_with<T: ImageTranscoder>(
     doc: &mut Document,
     quality: u8,
     verbose: bool,
     transcoder: &T,
+    dpi: Option<u32>,
 ) {
+    // Placement scan is needed only when downsampling is requested; without
+    // it (the default) the pipeline is byte-identical to before.
+    let placements = dpi.is_some().then(|| image_placements(doc));
+    let downsample = dpi
+        .zip(placements.as_ref())
+        .map(|(d, placements)| Downsample { dpi: d, placements });
     // Phase 1 — extract.
     let image_ids: Vec<ObjectId> = doc
         .objects
@@ -67,7 +92,8 @@ pub fn compress_images_with<T: ImageTranscoder>(
     let reencoded: Vec<(ObjectId, Stream)> = images
         .into_par_iter()
         .map(|(id, stream)| {
-            let stream = reencode_image_stream(id, stream, quality, verbose, &cache, transcoder);
+            let stream =
+                reencode_image_stream(id, stream, quality, verbose, &cache, transcoder, downsample);
             (id, stream)
         })
         .collect();
@@ -91,6 +117,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
     verbose: bool,
     cache: &TranscodeCache,
     transcoder: &T,
+    downsample: Option<Downsample<'_>>,
 ) -> Stream {
     let color_space_raw = stream
         .dict
@@ -107,6 +134,22 @@ fn reencode_image_stream<T: ImageTranscoder>(
         .get(b"Height")
         .and_then(|h| h.as_i64())
         .unwrap_or(0) as u32;
+
+    // Target dimensions from the `--dpi` cap. `None` when the cap does not
+    // bite (no dpi flag, no placement info, or already at/below the cap).
+    let resampled: Option<(u32, u32)> = downsample.and_then(|cap| {
+        let (placed_w, placed_h) = cap.placements.get(&id).copied()?;
+        if width == 0 || height == 0 || placed_w <= 0.0 || placed_h <= 0.0 {
+            return None;
+        }
+        let tw = ((placed_w * f64::from(cap.dpi) / 72.0).round() as u32)
+            .min(width)
+            .max(1);
+        let th = ((placed_h * f64::from(cap.dpi) / 72.0).round() as u32)
+            .min(height)
+            .max(1);
+        (tw != width || th != height).then_some((tw, th))
+    });
 
     // Detect filter: may be a Name or an Array
     let filter_name = stream.dict.get(b"Filter").ok();
@@ -167,28 +210,81 @@ fn reencode_image_stream<T: ImageTranscoder>(
         _ => None,
     };
 
-    let buf: Vec<u8> = match filter {
+    // `resized_buf` outlives the borrow in the encode request below, so a
+    // resampled raw stream's pixels stay alive across the cache lookup.
+    // (Set only in the resample branch; read only right after.)
+    let resized_buf: Option<Vec<u8>>;
+
+    // Re-encode, returning the new payload plus the dimensions it was
+    // written at (`None` = source dimensions, `Some` = downsampled).
+    let (buf, new_dims): (Vec<u8>, Option<(u32, u32)>) = match filter {
         Some(b"DCTDecode") | Some(b"JPXDecode") => {
-            verbose!(verbose, "[img {:?}] → processing JPEG/JPX via backend", id);
-            // Identical JPEG bytes re-encode identically: encode once, reuse
-            // the cached buffer for every duplicate image object.
-            let input = Input::Jpeg(&stream.content);
-            let key = encode_key(quality, 2, width, height, &stream.content);
-            let result = cache.get(key, || transcoder.transcode_image(&input, quality));
-            match result.as_ref() {
-                Ok(buf) if !buf.is_empty() => buf.clone(),
-                Ok(_) => {
+            if let Some((tw, th)) = resampled {
+                verbose!(
+                    verbose,
+                    "[img {:?}] → resampling {}x{} → {}x{} (dpi cap)",
+                    id,
+                    width,
+                    height,
+                    tw,
+                    th
+                );
+                // The backend decodes from concrete pixels (it cannot
+                // resize), so decode + downsample here and hand it pixels.
+                let Some((bytes, tag)) = resampled_pixels(&stream.content, tw, th) else {
                     verbose!(
                         verbose,
-                        "[img {:?}] → skipped: backend produced empty output",
+                        "[img {:?}] → skipped: JPEG decode failed during resample",
                         id
                     );
                     return stream;
-                }
-                Err(e) => {
-                    verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
-                    return stream;
-                }
+                };
+                let input = pixel_input(tag, tw, th, &bytes);
+                let key = encode_key(quality, tag, tw, th, &bytes);
+                let result = cache.get(key, || transcoder.transcode_image(&input, quality));
+                (
+                    match result.as_ref() {
+                        Ok(buf) if !buf.is_empty() => buf.clone(),
+                        Ok(_) => {
+                            verbose!(
+                                verbose,
+                                "[img {:?}] → skipped: backend produced empty output",
+                                id
+                            );
+                            return stream;
+                        }
+                        Err(e) => {
+                            verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                            return stream;
+                        }
+                    },
+                    Some((tw, th)),
+                )
+            } else {
+                verbose!(verbose, "[img {:?}] → processing JPEG/JPX via backend", id);
+                // Identical JPEG bytes re-encode identically: encode once,
+                // reuse the cached buffer for every duplicate image object.
+                let input = Input::Jpeg(&stream.content);
+                let key = encode_key(quality, 2, width, height, &stream.content);
+                let result = cache.get(key, || transcoder.transcode_image(&input, quality));
+                (
+                    match result.as_ref() {
+                        Ok(buf) if !buf.is_empty() => buf.clone(),
+                        Ok(_) => {
+                            verbose!(
+                                verbose,
+                                "[img {:?}] → skipped: backend produced empty output",
+                                id
+                            );
+                            return stream;
+                        }
+                        Err(e) => {
+                            verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                            return stream;
+                        }
+                    },
+                    None,
+                )
             }
         }
         Some(other_filter) => {
@@ -230,57 +326,95 @@ fn reencode_image_stream<T: ImageTranscoder>(
                     return stream;
                 }
             };
-            let (input, key_bytes, tag): (Input<'_>, &[u8], u8) = match &classified {
-                RawPixels::Luma(bytes) => (
-                    Input::Pixels(ImageRef::Luma8 {
+
+            // (encoder input, key bytes, kind, width, height)
+            let (input, key_bytes, tag, ew, eh): (Input<'_>, &[u8], u8, u32, u32) =
+                if let Some((tw, th)) = resampled {
+                    verbose!(
+                        verbose,
+                        "[img {:?}] → resampling {}x{} → {}x{} (dpi cap)",
+                        id,
                         width,
                         height,
-                        bytes,
-                    }),
-                    bytes,
-                    1,
-                ),
-                RawPixels::Rgb(bytes) => (
-                    Input::Pixels(ImageRef::Rgb8 {
-                        width,
-                        height,
-                        bytes,
-                    }),
-                    bytes,
-                    3,
-                ),
-                RawPixels::RgbaNormalized(rgb) => (
-                    Input::Pixels(ImageRef::Rgb8 {
-                        width,
-                        height,
-                        bytes: rgb.as_slice(),
-                    }),
-                    rgb.as_slice(),
-                    3,
-                ),
-            };
+                        tw,
+                        th
+                    );
+                    let tag = match &classified {
+                        RawPixels::Luma(_) => 1,
+                        _ => 3,
+                    };
+                    let bytes = resize_raw(&classified, width, height, tw, th);
+                    resized_buf = Some(bytes);
+                    let bytes = resized_buf.as_ref().expect("just set");
+                    (
+                        pixel_input(tag, tw, th, bytes),
+                        bytes.as_slice(),
+                        tag,
+                        tw,
+                        th,
+                    )
+                } else {
+                    match &classified {
+                        RawPixels::Luma(bytes) => (
+                            Input::Pixels(ImageRef::Luma8 {
+                                width,
+                                height,
+                                bytes,
+                            }),
+                            bytes,
+                            1,
+                            width,
+                            height,
+                        ),
+                        RawPixels::Rgb(bytes) => (
+                            Input::Pixels(ImageRef::Rgb8 {
+                                width,
+                                height,
+                                bytes,
+                            }),
+                            bytes,
+                            3,
+                            width,
+                            height,
+                        ),
+                        RawPixels::RgbaNormalized(rgb) => (
+                            Input::Pixels(ImageRef::Rgb8 {
+                                width,
+                                height,
+                                bytes: rgb.as_slice(),
+                            }),
+                            rgb.as_slice(),
+                            3,
+                            width,
+                            height,
+                        ),
+                    }
+                };
 
             // Same pixels → same JPEG, regardless of how the source stream
             // happened to be compressed. Width/height are keyed too: two
             // images with identical pixel bytes but different dimensions
             // must not share a cached JPEG.
-            let key = encode_key(quality, tag, width, height, key_bytes);
+            let key = encode_key(quality, tag, ew, eh, key_bytes);
             let result = cache.get(key, || transcoder.transcode_image(&input, quality));
-            match result.as_ref() {
-                Ok(buf) if !buf.is_empty() => buf.clone(),
-                Ok(_) => {
-                    verbose!(
-                        verbose,
-                        "[img {:?}] → skipped: backend produced empty output",
-                        id
-                    );
-                    return stream;
-                }
-                Err(e) => {
-                    verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
-                    return stream;
-                }
-            }
+            (
+                match result.as_ref() {
+                    Ok(buf) if !buf.is_empty() => buf.clone(),
+                    Ok(_) => {
+                        verbose!(
+                            verbose,
+                            "[img {:?}] → skipped: backend produced empty output",
+                            id
+                        );
+                        return stream;
+                    }
+                    Err(e) => {
+                        verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                        return stream;
+                    }
+                },
+                resampled,
+            )
         }
         None => {
             verbose!(
@@ -316,6 +450,11 @@ fn reencode_image_stream<T: ImageTranscoder>(
         stream
             .dict
             .set(b"Length", Object::Integer(stream.content.len() as i64));
+        if let Some((tw, th)) = new_dims {
+            // Downsampled: the raster is smaller, so the dict must say so.
+            stream.dict.set(b"Width", Object::Integer(tw as i64));
+            stream.dict.set(b"Height", Object::Integer(th as i64));
+        }
     } else {
         verbose!(
             verbose,
@@ -382,4 +521,66 @@ fn is_image_stream(stream: &Stream) -> bool {
         .and_then(|s| s.as_name())
         .ok()
         .is_some_and(|name| name == b"Image")
+}
+
+/// An [`Input`] over pixel bytes at the given size, from a kind tag
+/// (1 = luma, 3 = rgb).
+fn pixel_input<'a>(tag: u8, width: u32, height: u32, bytes: &'a [u8]) -> Input<'a> {
+    match tag {
+        1 => Input::Pixels(ImageRef::Luma8 {
+            width,
+            height,
+            bytes,
+        }),
+        _ => Input::Pixels(ImageRef::Rgb8 {
+            width,
+            height,
+            bytes,
+        }),
+    }
+}
+
+/// Decode a JPEG and downsample it to `(tw, th)`, returning the resized
+/// pixel buffer and its kind tag. `None` when the source cannot be decoded.
+/// Grayscale sources stay single-component, matching `/DeviceGray` streams.
+fn resampled_pixels(jpeg: &[u8], tw: u32, th: u32) -> Option<(Vec<u8>, u8)> {
+    let decoded = image::load_from_memory(jpeg).ok()?;
+    // `imageops::resize` on a `DynamicImage` yields an RGBA buffer; convert
+    // RGB sources to 3-channel first so the encoder sees the right format.
+    match decoded {
+        image::DynamicImage::ImageLuma8(gray) => {
+            let resized =
+                image::imageops::resize(&gray, tw, th, image::imageops::FilterType::Triangle);
+            Some((resized.into_raw(), 1))
+        }
+        other => {
+            let rgb = other.to_rgb8();
+            let resized =
+                image::imageops::resize(&rgb, tw, th, image::imageops::FilterType::Triangle);
+            Some((resized.into_raw(), 3))
+        }
+    }
+}
+
+/// Downsample a classified pixel buffer to `(tw, th)`, preserving its
+/// channel count. `classify_raw` already validated the dimensions, so the
+/// `from_raw` calls cannot fail.
+fn resize_raw(classified: &RawPixels<'_>, width: u32, height: u32, tw: u32, th: u32) -> Vec<u8> {
+    match classified {
+        RawPixels::Luma(bytes) => {
+            let img =
+                image::GrayImage::from_raw(width, height, bytes.to_vec()).expect("validated dims");
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
+        }
+        RawPixels::Rgb(bytes) => {
+            let img =
+                image::RgbImage::from_raw(width, height, bytes.to_vec()).expect("validated dims");
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
+        }
+        RawPixels::RgbaNormalized(rgb) => {
+            let img =
+                image::RgbImage::from_raw(width, height, rgb.clone()).expect("validated dims");
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
+        }
+    }
 }

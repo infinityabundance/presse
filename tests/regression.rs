@@ -194,6 +194,59 @@ fn add_image_page(
     push_kid(doc, pages_id, page_id);
 }
 
+/// Like [`add_image_page`], but drawn at `placed_w × placed_h` points
+/// instead of at pixel size, so the effective resolution of the image can
+/// be set independently of its raster (pixels ÷ (points/72) dpi).
+fn add_image_page_at(
+    doc: &mut Document,
+    pages_id: lopdf::ObjectId,
+    pixels: Vec<u8>,
+    w: u32,
+    h: u32,
+    gray: bool,
+    placed: (f64, f64),
+) {
+    let mut image_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => w as i64,
+        "Height" => h as i64,
+        "BitsPerComponent" => 8,
+    };
+    image_dict.set("ColorSpace", if gray { "DeviceGray" } else { "DeviceRGB" });
+    let mut image_stream = Stream::new(image_dict, pixels);
+    image_stream.compress().unwrap(); // FlateDecode → re-encodable
+    let image_id = doc.add_object(image_stream);
+
+    let content = Content {
+        operations: vec![
+            Operation::new("q", vec![]),
+            Operation::new(
+                "cm",
+                vec![
+                    placed.0.into(),
+                    0.into(),
+                    0.into(),
+                    placed.1.into(),
+                    0.into(),
+                    0.into(),
+                ],
+            ),
+            Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+            Operation::new("Q", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), placed.0.into(), placed.1.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+    });
+    push_kid(doc, pages_id, page_id);
+}
+
 fn add_text_page(doc: &mut Document, pages_id: lopdf::ObjectId, page_no: u32) {
     let content = Content {
         operations: vec![
@@ -894,6 +947,148 @@ fn gapped_numbering_with_multiple_object_streams_is_valid() {
     assert_visual_similarity(&dir, "gapped", 0.99);
 }
 
+/// `--dpi` downsampling: a 300×300 image drawn at 100×100 pt is 216 dpi
+/// effective; at `-d 150` it must be resampled to ≈100·150/72 = 208 px and
+/// the `/Width`/`/Height` dictionary entries updated to match, with the
+/// output still structurally valid and visually recognizable.
+#[test]
+fn dpi_downsampling_resizes_placed_images_and_updates_dims() {
+    let dir = test_dir();
+
+    let mut pre = new_doc();
+    add_image_page_at(
+        &mut pre.0,
+        pre.1,
+        photoish_rgb(300, 300),
+        300,
+        300,
+        false,
+        (100.0, 100.0),
+    );
+    save_pdf(&mut pre.0, dir.join("dpi-pre.pdf").to_str().unwrap()).unwrap();
+
+    let mut post = new_doc();
+    add_image_page_at(
+        &mut post.0,
+        post.1,
+        photoish_rgb(300, 300),
+        300,
+        300,
+        false,
+        (100.0, 100.0),
+    );
+    compress_images_with(&mut post.0, QUALITY, false, &CpuTranscoder, Some(150));
+    compress_and_save_pdf(
+        &mut post.0,
+        dir.join("dpi-post.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("dpi-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, _, dict) = &images[0];
+    assert_eq!(
+        dict.get(b"Width").and_then(|w| w.as_i64()).ok(),
+        Some(208),
+        "/Width must reflect the resampled raster"
+    );
+    assert_eq!(
+        dict.get(b"Height").and_then(|h| h.as_i64()).ok(),
+        Some(208),
+        "/Height must reflect the resampled raster"
+    );
+    assert_eq!(
+        dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
+        Some(b"DCTDecode".as_slice()),
+        "resampled image must be re-encoded as DCTDecode"
+    );
+
+    // Same placement, less detail: still the same page at high SSIM.
+    assert_visual_similarity(&dir, "dpi", 0.85);
+}
+
+/// `--dpi` above the effective resolution must not bite: a 300×300 image at
+/// 216 dpi effective stays 300×300 under a 600 dpi cap.
+#[test]
+fn dpi_above_effective_resolution_keeps_source_size() {
+    let dir = test_dir();
+
+    let mut doc = new_doc();
+    add_image_page_at(
+        &mut doc.0,
+        doc.1,
+        photoish_rgb(300, 300),
+        300,
+        300,
+        false,
+        (100.0, 100.0),
+    );
+    compress_images_with(&mut doc.0, QUALITY, false, &CpuTranscoder, Some(600));
+    compress_and_save_pdf(
+        &mut doc.0,
+        dir.join("dpi-noop.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("dpi-noop.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, _, dict) = &images[0];
+    assert_eq!(dict.get(b"Width").and_then(|w| w.as_i64()).ok(), Some(300));
+    assert_eq!(dict.get(b"Height").and_then(|h| h.as_i64()).ok(), Some(300));
+}
+
+/// CLI end-to-end: `presse press -d 75` on a high-resolution placed image
+/// produces a valid, smaller PDF (qpdf + gs + xref gates in
+/// `assert_well_formed`) whose image raster was actually reduced.
+#[test]
+fn press_cli_dpi_flag_resamples_and_stays_valid() {
+    let dir = test_dir();
+    let mut doc = new_doc();
+    add_image_page_at(
+        &mut doc.0,
+        doc.1,
+        photoish_rgb(600, 600),
+        600,
+        600,
+        false,
+        (200.0, 200.0),
+    );
+    save_pdf(&mut doc.0, dir.join("dpi-cli-pre.pdf").to_str().unwrap()).unwrap();
+
+    let presse = env!("CARGO_BIN_EXE_presse");
+    let out = dir.join("dpi-cli-post.pdf");
+    let status = Command::new(presse)
+        .args([
+            "press",
+            dir.join("dpi-cli-pre.pdf").to_str().unwrap(),
+            "-q",
+            "50",
+            "-d",
+            "75",
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("presse binary should run");
+    assert!(
+        status.success(),
+        "presse press -d 75 must exit successfully"
+    );
+
+    let loaded = assert_well_formed(&out);
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, _, dict) = &images[0];
+    // 600 px at 200 pt = 216 dpi effective → 200·75/72 ≈ 208 px.
+    assert_eq!(dict.get(b"Width").and_then(|w| w.as_i64()).ok(), Some(208));
+    assert_eq!(dict.get(b"Height").and_then(|h| h.as_i64()).ok(), Some(208));
+    assert_visual_similarity(&dir, "dpi-cli", 0.85);
+}
+
 // ---------------------------------------------------------------------------
 // Pluggable acceleration (`--acceleration`) — all testable without a GPU.
 // ---------------------------------------------------------------------------
@@ -939,7 +1134,7 @@ fn gpu_failure_falls_back_to_cpu_identically() {
     // threshold 0 → every stream consults the (failing) GPU first.
     let fallback = FallbackTranscoder::new(Some(FailingGpu), 0);
     let mut fb_doc = build();
-    compress_images_with(&mut fb_doc, QUALITY, false, &fallback);
+    compress_images_with(&mut fb_doc, QUALITY, false, &fallback, None);
 
     let (cpu_path, fb_path) = (
         dir.join("gpu-fallback-pre.pdf"),
@@ -1097,7 +1292,7 @@ fn cpu_transcoder_default_parity() {
     let mut plain = build();
     compress_images(&mut plain, QUALITY, false);
     let mut explicit = build();
-    compress_images_with(&mut explicit, QUALITY, false, &CpuTranscoder);
+    compress_images_with(&mut explicit, QUALITY, false, &CpuTranscoder, None);
 
     let (p_path, e_path) = (
         dir.join("parity-plain.pdf"),

@@ -76,6 +76,50 @@ ghostscript's scan sizes (e.g. irs_fw2 2.02 vs 0.18 MB — gs still smaller
 because it throws away most of the pixels) while holding SSIM ≥ 0.997 at
 full resolution.
 
+## Resolution (`--dpi`) sweep
+
+`presse press -d <dpi>` caps the effective resolution of every placed
+image: an image drawn at `w×h` points is downsampled to at most
+`w·dpi/72 × h·dpi/72` pixels (Ghostscript `/ebook`-style), so only images
+placed above the target are touched — images already below it pass through
+at source resolution, and the default (no `-d`) never downsamplies.
+Placement is read from the page content stream's transform matrix at each
+`Do` (the largest placement wins for shared images); images whose
+placement cannot be parsed are left at source resolution.
+
+Measured `-q 50` over high-resolution-placed files (60 dpi renders, SSIM
+vs source, best-of-1):
+
+| file (source) | no cap | 600 dpi | 300 dpi | 150 dpi | 75 dpi |
+|---|---|---|---|---|---|
+| irs_i1040 (4.43 MB, scans) | 4.17 MB / 1.0000 | 4.17 / 1.0000 | 3.88 / 1.0000 | 3.58 / 1.0000 | 3.47 / 1.0000 |
+| irs_f1099r (0.62 MB) | 0.48 / 1.0000 | 0.48 / 1.0000 | 0.48 / 1.0000 | 0.45 / 1.0000 | 0.44 / 0.9999 |
+| irs_fw2 (2.15 MB) | 2.03 / 1.0000 | 1.96 / 1.0000 | 1.95 / 1.0000 | 1.92 / 1.0000 | 1.91 / 0.9999 |
+| arxiv_cyclegan1703 (37.6 MB) | 6.86 / 1.0000 | 6.86 / 1.0000 | 6.86 / 1.0000 | 6.86 / 1.0000 | 6.86 / 1.0000 |
+| arxiv_gpt3_2005 (6.77 MB) | 5.69 / 1.0000 | 5.69 / 1.0000 | 5.69 / 1.0000 | 5.69 / 1.0000 | 5.69 / 1.0000 |
+| photos20 (12.08 MB, 72 dpi placement) | 11.04 / 1.0000 | 11.04 / 1.0000 | 11.04 / 1.0000 | 11.04 / 1.0000 | 11.04 / 1.0000 |
+
+Readings:
+
+- SSIM stays ≥ 0.9999 at every level — downsampling is visually lossless
+  on these renders; the size win is pure resolution removal, and 75/150
+  dpi costs nothing perceptible on scans (irs_i1040: 21.7% / 19.3%
+  reduction at SSIM 1.0000).
+- The cap only bites where it should: paper PDFs whose figures are placed
+  at ~72–150 dpi (gpt3, cyclegan) and photo PDFs placed at 72 dpi
+  (photos20) are byte-identical to the no-cap run at every level — the
+  same pass-through Ghostscript exhibits below its 150 dpi target.
+- `-d 600` is a no-op for documents whose images are all placed below
+  600 dpi, and a strict resolution cap (never an upscale) above it.
+
+Corpus-wide gate (100-file corpus, `-d 150`, `-q 50`): 100/100 runs
+completed with 0 failures; qpdf check matches the CPU corpus exactly
+(94 clean + the same 4 benign warnings: 3× "input stream is complete"
+and the pre-existing `issue7229` damaged-source artifact); visual sweep
+97/97 valid docs clean, worst SSIM 0.98 (`arxiv_deeplab1706` — figures
+placed above 150 dpi, downsampled as asked), the only flag being the same
+`issue7229` source artifact the original file triggers.
+
 ## The non-compressors
 
 Measured so their speed is not mistaken for compression throughput:
