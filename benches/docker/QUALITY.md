@@ -120,6 +120,78 @@ and the pre-existing `issue7229` damaged-source artifact); visual sweep
 placed above 150 dpi, downsampled as asked), the only flag being the same
 `issue7229` source artifact the original file triggers.
 
+## Pareto frontier vs modern full-resolution compressors
+
+The render-SSIM gate was upgraded in response to a fair critique: SSIM at
+60 dpi proves 60-dpi viewing fidelity, not print or native fidelity. Two
+witnesses were added — render SSIM at **72 and 300 dpi**, and a
+**native-image witness** (`native_image_ssim.py`): every image stream is
+extracted (`pdfimages -j`), decoded, the source resampled to the *shipped*
+dimensions, and SSIM computed with a 512 px analysis window instead of the
+screen-fidelity 64×64. The two witnesses disagree on purpose, and the
+native one is the stricter of the two:
+
+> gs `/ebook` scores **1.0000 at a 300 dpi render** on an IRS scan PDF, yet
+> ships its 5784×1448 scans as **165×41** images at **native SSIM 0.86**.
+> No render scale at the 64×64 window can expose that; the native witness
+> can. The same check gives presse/qpdf/mutool/pdf-optimizer native SSIM
+> ≥ 0.9999 — they never down-sample, so their fidelity is exactly what the
+> render shows.
+
+Tools, compared at *equal measured fidelity* (SSIM thresholds, not equal
+quality numbers), `benches/docker/pareto.py`: presse (`-q 30/50/75`, ±
+`-d 150`), qpdf 12.3 (`--optimize-images --jpeg-quality`, explicitly does
+not resample), MuPDF 1.28 recompression (`clean -i -gggg -z
+--{color,gray}{,-lossless}-image-recompress-method jpeg:N`, recompress-only-
+when-smaller), pdf-optimizer 1.0 (MuPDF-based, `--dpi 0`), ghostscript
+`/screen…/prepress`. Sizes at SSIM ≥ 0.9999 (300 dpi render) on sampled
+pages:
+
+| file | presse | qpdf | mutool | pdf-optimizer | gs /ebook |
+|---|---|---|---|---|---|
+| irs_fw2 scans (2.15 MB) | 2.03 (q50) / 1.92 (-d150) | **1.52** | 2.54 | 2.55 | 0.18¹ |
+| arxiv_gpt3 paper (6.77 MB) | 5.03 (q30) | 4.53 | **4.34** | 6.20 | 2.04¹ |
+| photos20 (12.08 MB, 72 dpi) | 7.65 (q30) | **6.22** | 6.38 | 10.58 | 12.07 (no-op) |
+| photos60 (36 MB, 60 imgs) | 22.96 (q30) | 18.67 | **6.76** (dedup) | 31.72 | 12.08 (no-op) |
+
+¹ below any full-res tool's size *because it down-samples* — native SSIM
+0.86 on the scans; on papers/photos it is a pass-through.
+
+Speed at the same fidelity (wall time, best-of-1):
+
+| file | presse | qpdf | mutool | pdf-optimizer |
+|---|---|---|---|---|
+| irs_fw2 | **0.16 s** | 0.09 s | 0.56 s | 0.30 s |
+| photos20 | **0.25 s** | 0.99 s | 1.27 s | 5.92 s |
+| photos60 | **0.26 s** | 2.93 s | 3.87 s | 17.82 s |
+
+Readings:
+
+- **At equal measured fidelity the full-res tools are visually
+equivalent** (SSIM 1.0000, native 0.9999+) — the frontier is decided by
+size and speed. qpdf is the size leader on scans; mutool's `-gggg`
+dedup wins duplicate-heavy documents (photos60 q30: 6.76 vs 18.67 MB);
+presse's parallel path is **4–70× faster** on image-heavy documents at
+the same fidelity (photos20/60: 0.25–0.26 s vs qpdf 0.99–2.93 s, mutool
+1.27–3.87 s, pdf-optimizer 5.9–17.8 s). qpdf is faster on a single-scan
+file (irs_fw2: 0.09 vs 0.16 s) — the speedup is the parallelized image
+phase, which only pays off with many images.
+- **gs wins size only by removing pixels**, which only the native witness
+reveals — at equal *native* fidelity its /ebook output would sit at
+~1.5–2.0 MB on the scans, next to qpdf.
+- **The Pareto claim this supports**: among open-source full-resolution
+PDF image compressors, presse is the fastest measured point on
+image-heavy documents at SSIM ≥ 0.9999 (4–70×), qpdf the smallest on
+scan corpora, mutool on duplicate-heavy ones — and the speed gap is
+what the rayon pipeline buys.
+
+Caveats: sizes/times are best-of-1 on sampled pages (≤ 8/file) and the
+photo PDFs' 41-inch pages exceed the 300 dpi render budget (their witness
+is the 72 dpi render + native-image check, both 1.0000); quality numbers
+are page-render SSIM + image-level SSIM, not a full semantic-preservation
+court (ICC, annotations, forms, layers are validated by the qpdf/gs gates
+but not separately measured).
+
 ## The non-compressors
 
 Measured so their speed is not mistaken for compression throughput:
