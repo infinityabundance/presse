@@ -125,6 +125,20 @@ presse merge *.png *.pdf
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
+### Resolution capping (`--dpi`)
+
+`-d <dpi>` downsamples images to at most `w·dpi/72 × h·dpi/72` pixels,
+where `w × h` is the image's placed size on the page in points — the same
+placement-aware rule Ghostscript applies with `-dPDFSETTINGS`. The cap is
+strict: it **never up-samples**, and images whose on-page placement cannot
+be determined (or that are already below the cap) keep their source
+resolution. Only `press` takes the flag today.
+
+```bash
+presse press big.pdf -o small.pdf -d 150   # ~ebook: 150 dpi cap
+presse press scans.pdf -d 75               # ~screen: 75 dpi cap
+```
+
 ### Merge — `presse merge`
 
 ```bash

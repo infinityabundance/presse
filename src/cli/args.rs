@@ -33,9 +33,14 @@ pub enum Commands {
         acceleration: Acceleration,
 
         /// Cap the effective resolution of placed images to DPI pixels per
-        /// inch (75 screen, 150 ebook, 300 printer, 600 prepress). Omitted:
-        /// images keep their source resolution.
-        #[arg(short = 'd', long, value_name = "DPI", value_parser = clap::value_parser!(u32).range(1..))]
+        /// inch. Omitted: images keep their source resolution.
+        #[arg(
+            short = 'd',
+            long,
+            value_name = "DPI",
+            value_parser = clap::value_parser!(u32).range(1..),
+            long_help = "Cap the effective resolution of placed images to DPI pixels per inch.\n\nAn image drawn at w×h points is downsampled to at most w·DPI/72 × h·DPI/72\npixels (the same placement-aware rule Ghostscript's -dPDFSETTINGS uses). The\ncap is strict: it never up-samples, and images whose on-page placement\ncannot be determined keep their source resolution.\n\nPresets:\n  75   screen     – low resolution\n  150  ebook      – medium resolution\n  300  printer    – high quality\n  600  prepress   – high quality, color preserving\n\nDefault (flag omitted): no downsampling, current behavior.",
+        )]
         dpi: Option<u32>,
 
         // Details during the compression process --> sizes comparison before & after
