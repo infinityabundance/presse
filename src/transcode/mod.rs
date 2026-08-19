@@ -30,11 +30,21 @@ pub mod cuda;
 pub mod rocm;
 
 /// Minimum encoder-input size (bytes) before a GPU backend is consulted.
-/// Below this, PCIe transfer overhead exceeds the decode/encode time saved,
-/// so small streams always stay on the CPU path.
+/// Below this, streams always stay on the CPU path.
+///
+/// Measured crossover (RTX 4080 SUPER, 16 cores, `-C target-cpu=native`,
+/// q50): routing small/medium images through the single GPU consumer thread
+/// serializes work that the 16 rayon workers parallelize better, so the GPU
+/// pays off only on the largest images of a document — where offloading
+/// them frees the CPU to keep processing the rest concurrently. Sweeping
+/// the threshold over mixed / small-heavy / photo documents, 1 MiB was the
+/// best value: 26–60% faster than the previous 128 KiB default and faster
+/// than the pure-CPU path on the mixed corpus. Documents whose images are
+/// uniformly huge (all >1 MiB) remain a wash — the GPU ties the CPU
+/// per-image there, so no threshold helps.
 // Used only by the `cuda`/`rocm` feature-gated backends.
 #[allow(dead_code)]
-pub const GPU_MIN_STREAM_BYTES: usize = 128 * 1024;
+pub const GPU_MIN_STREAM_BYTES: usize = 1024 * 1024;
 
 /// Decoded pixels ready for re-encoding.
 #[derive(Debug, Clone, Copy)]
