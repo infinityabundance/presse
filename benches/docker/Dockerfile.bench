@@ -24,9 +24,11 @@ FROM debian:bookworm-slim
 
 # hyperfine for timing, poppler-utils for PDF validation (pdfinfo/pdftoppm),
 # mupdf-tools for the mutool clean -gggg -z (lossless repack) comparison,
-# `time` for peak-RSS measurement.
+# pngquant + tesseract-ocr-eng for the ocrmypdf optimizer leg of the Pareto
+# sweep (its --optimize 2/3 mode hard-requires pngquant), `time` for
+# peak-RSS measurement.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends hyperfine poppler-utils mupdf-tools time \
+ && apt-get install -y --no-install-recommends hyperfine poppler-utils mupdf-tools pngquant tesseract-ocr-eng time \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/target/release/presse /usr/local/bin/presse

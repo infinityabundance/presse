@@ -10,6 +10,9 @@ at multiple DPIs), not at equal arbitrary quality numbers:
   mutool          clean -i -gggg -z --{color,gray}{,-lossless}-image-recompress-method jpeg:<q>
                   ("recompress when smaller" is the default; no subsampling)
   pdf-optimizer   -q <q> --dpi <0|150>
+  ocrmypdf        python3 -m ocrmypdf -m skip -l eng --output-type pdf --optimize 3
+                  --jpeg-quality <q> (needs pngquant + tesseract-ocr-eng + the
+                  hocr config at runtime — installable via the bench image)
 
 For every file × tool × setting: output size, wall time, and SSIM of
 renders vs the source at each DPI in --render-dpis (screen 72, ebook 150,
@@ -95,8 +98,21 @@ def tool_settings(tools: list[str]) -> list[tuple[str, str, list[str]]]:
                                             "{in}", "{out}"]))
         out.append(("pdf-optimizer", f"q{q}", ["node", "{pdfopt}", "-q", str(q), "--dpi", "0",
                                                "{in}", "-o", "{out}"]))
-    out.append(("presse", "q50-d150", ["{presse}", "press", "-q", "50", "-d", "150", "{in}", "-o", "{out}"]))
-    out.append(("presse", "q75-d150", ["{presse}", "press", "-q", "75", "-d", "150", "{in}", "-o", "{out}"]))
+        out.append(("ocrmypdf", f"q{q}", ["python3", "-m", "ocrmypdf", "-m", "skip", "-l", "eng",
+                                           "--output-type", "pdf", "--optimize", "3",
+                                           f"--jpeg-quality={q}", "{in}", "{out}"]))
+    # The dpi × ssim cross matrix (q50 base): every combination of the two
+    # quality knobs, so a cell like d150-s0.86 is `press -q 50 -d 150 -s 0.86`.
+    for d in [None, 75, 150, 300, 600]:
+        for s in [None, 0.86, 0.72]:
+            label = f"d{d or 0}-s{s if s else 1.0}"
+            cmd = ["{presse}", "press", "-q", "50"]
+            if d:
+                cmd += ["-d", str(d)]
+            if s:
+                cmd += ["-s", f"{s:.2f}"]
+            cmd += ["{in}", "-o", "{out}"]
+            out.append(("presse", label, cmd))
     out.append(("pdf-optimizer", "q50-d150", ["node", "{pdfopt}", "-q", "50", "--dpi", "150",
                                               "{in}", "-o", "{out}"]))
     for s in ["screen", "ebook", "printer", "prepress"]:
@@ -113,7 +129,7 @@ def main():
     ap.add_argument("--render-dpis", default="72,300")
     ap.add_argument("--thresholds", default="0.9999,0.999,0.995,0.99")
     ap.add_argument("--pages", type=int, default=8)
-    ap.add_argument("--tools", default="presse,qpdf,mutool,pdf-optimizer,ghostscript")
+    ap.add_argument("--tools", default="presse,qpdf,mutool,pdf-optimizer,ghostscript,ocrmypdf")
     ap.add_argument("--csv", type=Path)
     args = ap.parse_args()
 

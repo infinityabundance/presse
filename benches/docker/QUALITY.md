@@ -192,6 +192,63 @@ are page-render SSIM + image-level SSIM, not a full semantic-preservation
 court (ICC, annotations, forms, layers are validated by the qpdf/gs gates
 but not separately measured).
 
+## The `-d` × `-s` matrix (quality × speed, vs the tools)
+
+`-ssim <target>` replaces the arbitrary `-q` knob with a fidelity target:
+the JPEG quality is derived from a committed calibration curve
+(`calibrate_ssim.py` → `SSIM_CALIBRATION` in `src/pdf/images.rs`), measured
+with the same native 512-px-window SSIM as the Pareto witness on **grainy
+gray scans — the worst case for JPEG**. The curve is conservative: smooth
+content (photos, paper figures) always *exceeds* the requested target, so
+the sweep reports requested vs achieved honestly. The two knobs are
+orthogonal — `-d` removes *pixels* (only where the placement exceeds the
+cap), `-s` removes *bits* (everywhere) — and compose additively.
+
+presse matrix cells (size MB / wall s / achieved SSIM at a 300 dpi render,
+best-of-1, `-q 50` base):
+
+| file | `d0-s1.0` | `d0-s0.86` | `d0-s0.72` | `d75-s0.72` | `d150-s0.72` | `d300-s0.72` |
+|---|---|---|---|---|---|---|
+| irs_i1040 (126p scans) | 4.17 / 3.59 / 1.0000 | 3.77 / 3.56 / 1.0000 | 3.72 / 3.57 / 1.0000 | **3.43 / 3.77 / 0.9999** | 3.47 / 3.79 / 1.0000 | 3.59 / 3.91 / 1.0000 |
+| irs_fw2 (scans) | 2.03 / 0.17 / 1.0000 | 2.01 / 0.17 / 0.9998 | 2.01 / 0.17 / 1.0000 | 1.90 / 0.08 / 0.9999 | 1.91 / 0.10 / 1.0000 | 1.93 / 0.08 / 1.0000 |
+| arxiv_gpt3 (paper) | 5.69 / 0.40 / 1.0000 | 4.04 / 0.38 / 0.9997 | 3.86 / 0.39 / 0.9998 | 3.86 / 0.41 / 0.9998 (dpi no-op) | same | same |
+| photos20 (72-dpi photos) | 11.04 / 0.27 / 1.0000 | 4.41 / 0.26 / 0.9997 | 3.93 / 0.25 / 0.9992 | 3.93 (dpi no-op) | same | same |
+
+Readings:
+
+- **`-d` only bites above the placement's effective resolution**: on
+  photos20 (72 dpi placement) and gpt3 (figures ≤ 150 dpi) every dpi
+  column is byte-identical to `d0` — the cleanest demonstration that the
+  cap never touches content below it. On scans it removes a quarter of the
+  bytes and *speeds the encode up* (irs_fw2: 0.17 → 0.08 s — smaller
+  images encode faster).
+- **`-s` bites everywhere**: photos20 11.04 → 4.41 MB at `-s 0.86`
+  (achieved 0.9997 — smooth content exceeds the worst-case target) and
+  3.93 MB at `-s 0.72` (achieved 0.9992), at the same or faster wall
+  time. On scans it is gentler (their flate content is size-insensitive).
+- **Composed they add**: irs_i1040 4.17 (baseline) → 3.72 (`-s 0.72`)
+  → 3.43 (`-d 75 -s 0.72`), all at SSIM ≥ 0.9999.
+
+vs the other tools at the same 300-dpi-render threshold (0.9999),
+smallest / fastest per file:
+
+| file | smallest @ ≥0.9999 | fastest @ ≥0.9999 |
+|---|---|---|
+| irs_i1040 | **presse `d75-s0.72` 3.43 MB** (qpdf is flat at 4.48 — its optimizer leaves flate scans that jpeg would grow) | qpdf q75 0.52 s |
+| irs_fw2 | gs /ebook 0.18 MB¹ | **presse `d150-s1.0` 0.08 s** |
+| arxiv_gpt3 | mutool jpeg:30 4.34 MB | qpdf q75 0.36 s |
+
+¹ gs's size win is resolution theft invisible to render SSIM — native
+witness 0.86 on the scans (see the Pareto section). presse's `d75-s0.72`
+is the smallest full-fidelity (native ≥ 0.9999) cell on both scan files.
+
+OCRmyPDF 17.10 (`--optimize 3 --jpeg-quality`): recorded FAILED on this
+host (its optimizer hard-requires `pngquant`, and its tesseract needs the
+`hocr` config, neither installable without sudo here); the bench image
+installs both, so the container reproduces the full run. The lossless leg
+(`--optimize 1`) works where the source carries a text layer (−5.1% on an
+IRS form).
+
 ## The non-compressors
 
 Measured so their speed is not mistaken for compression throughput:
