@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
   downsampling with Ghostscript-style presets (75 screen, 150 ebook,
   300 printer, 600 prepress). Strict cap: never up-samples; images whose
   placement cannot be determined keep source resolution.
+- **`--ssim` fidelity target** (`press -s <target>`) — a quality knob
+  calibrated to measured SSIM (native 512-px window, worst-case grainy
+  scans) instead of an arbitrary quality number. `-s 0.86` ≈ q9 and
+  `-s 0.72` ≈ q6 on the calibration content; smoother content always
+  exceeds the target. Lower targets compress harder and encode faster
+  (photos20: 11.0 → 4.4 MB at `-s 0.86`, same-or-faster wall time).
 - **Pluggable GPU transcoders** — `--acceleration cuda|rocm` behind a
   unified `ImageTranscoder` trait with graceful per-stream CPU fallback
   (opt-in Cargo features; not linked into default builds).

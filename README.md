@@ -122,6 +122,7 @@ presse merge *.png *.pdf
 | `-o, --output` | `<input>_compressed.pdf` | Output file or directory |
 | `-q, --quality` | `80` | Image recompression quality (0–100) |
 | `-d, --dpi` | source resolution | Cap placed image resolution to DPI pixels/inch (75 screen, 150 ebook, 300 printer, 600 prepress); omitted = keep source resolution |
+| `-s, --ssim` | `1.0` | Target output fidelity as measured SSIM (calibrated on grainy scans — the worst case for JPEG — so smoother content exceeds the target); lower = smaller and faster. `1.0` = use `-q` as given |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -137,6 +138,7 @@ resolution. Only `press` takes the flag today.
 ```bash
 presse press big.pdf -o small.pdf -d 150   # ~ebook: 150 dpi cap
 presse press scans.pdf -d 75               # ~screen: 75 dpi cap
+presse press deck.pdf -s 0.86              # ~q9: fidelity-targeted, 60% smaller on photos
 ```
 
 ### Merge — `presse merge`

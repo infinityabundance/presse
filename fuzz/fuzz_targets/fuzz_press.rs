@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use presse::pdf::images::compress_images;
+use presse::pdf::images::{QualityMode, compress_images, compress_images_with};
 use presse::pdf::writer::compress_and_save_pdf;
 
 const OUT: &str = "/tmp/presse-fuzz-out.pdf";
@@ -20,6 +20,19 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut doc) = lopdf::Document::load_mem(data) else {
         return; // rejected input — not a crash
     };
-    compress_images(&mut doc, 50, false);
+    // Exercise the calibrated `-ssim` path too (quality derived from the
+    // target via the committed curve), then the plain `-q` path.
+    compress_images_with(
+        &mut doc,
+        QualityMode::press(50, Some(0.72)),
+        false,
+        &presse::transcode::CpuTranscoder,
+        None,
+    );
     let _ = compress_and_save_pdf(&mut doc, OUT, false);
+    let Ok(mut doc2) = lopdf::Document::load_mem(data) else {
+        return;
+    };
+    compress_images(&mut doc2, 50, false);
+    let _ = compress_and_save_pdf(&mut doc2, OUT, false);
 });
