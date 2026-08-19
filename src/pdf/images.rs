@@ -6,6 +6,12 @@ use crate::transcode::{
     CpuTranscoder, ImageRef, ImageTranscoder, Input, TranscodeCache, encode_key,
 };
 
+// Pipeline contract: (1) image streams are detached from the `Document` into
+// owned buffers; (2) rayon re-encodes them in parallel; (3) results are
+// written back in one serial pass. Worker threads never touch the `Document`
+// — they own their buffers. The only shared structure is the dedup cache
+// (internally synchronized); nothing else needs a lock.
+
 /// Fixed-size block used for raw pixel buffer processing.
 /// 32 KiB keeps the working set inside the L1/L2 caches (and aligned with
 /// 4-byte pixels), so multi-MB scans are walked in cache-resident slices
@@ -135,8 +141,10 @@ fn reencode_image_stream<T: ImageTranscoder>(
         .and_then(|h| h.as_i64())
         .unwrap_or(0) as u32;
 
-    // Target dimensions from the `--dpi` cap. `None` when the cap does not
-    // bite (no dpi flag, no placement info, or already at/below the cap).
+    // Target dimensions from the `--dpi` cap (Ghostscript-style presets:
+    // 75 screen, 150 ebook, 300 printer, 600 prepress). The cap is a strict
+    // resolution *cap* — it never up-samples, and images whose placement is
+    // unknown stay at source resolution.
     let resampled: Option<(u32, u32)> = downsample.and_then(|cap| {
         let (placed_w, placed_h) = cap.placements.get(&id).copied()?;
         if width == 0 || height == 0 || placed_w <= 0.0 || placed_h <= 0.0 {

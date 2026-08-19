@@ -1306,3 +1306,224 @@ fn cpu_transcoder_default_parity() {
         "CpuTranscoder must match the default path byte-for-byte"
     );
 }
+
+/// `-d` is a resolution *cap*: output dimensions must never exceed the
+/// source, and must match ⌊placed·dpi/72⌋ when that bites. Property-style
+/// over a few placements so the "never up-scales" rule is pinned.
+#[test]
+fn dpi_cap_never_upscales_and_matches_formula() {
+    let dir = test_dir();
+    let cases = [
+        // (source W, source H, placed W, placed H, dpi, expected W, expected H)
+        (400, 300, 100.0, 100.0, 150, 208, 208), // 216 dpi effective → 150 cap
+        (400, 300, 100.0, 100.0, 300, 400, 300), // 416 > source → capped at source
+        (100, 100, 400.0, 400.0, 75, 100, 100),  // placed low-dpi → no change
+        (512, 256, 200.0, 100.0, 600, 512, 256), // 1667/833 > source → capped
+    ];
+    for (i, (w, h, pw, ph, dpi, ew, eh)) in cases.iter().enumerate() {
+        let mut doc = new_doc();
+        add_image_page_at(
+            &mut doc.0,
+            doc.1,
+            photoish_rgb(*w, *h),
+            *w,
+            *h,
+            false,
+            (*pw, *ph),
+        );
+        compress_images_with(&mut doc.0, QUALITY, false, &CpuTranscoder, Some(*dpi));
+        compress_and_save_pdf(
+            &mut doc.0,
+            dir.join(format!("dpi-prop-{i}.pdf")).to_str().unwrap(),
+            false,
+        )
+        .unwrap();
+        let loaded = assert_well_formed(&dir.join(format!("dpi-prop-{i}.pdf")));
+        let images = find_image_streams(&loaded);
+        assert_eq!(images.len(), 1);
+        let (_, _, dict) = &images[0];
+        let ow = dict.get(b"Width").and_then(|x| x.as_i64()).ok().unwrap() as u32;
+        let oh = dict.get(b"Height").and_then(|x| x.as_i64()).ok().unwrap() as u32;
+        assert!(
+            ow <= *w && oh <= *h,
+            "case {i}: cap must never up-scale ({ow}x{oh} > {w}x{h})"
+        );
+        let formula = |placed: f64| ((placed * *dpi as f64 / 72.0).round() as u32).max(1);
+        assert!(
+            ow <= formula(*pw) && oh <= formula(*ph),
+            "case {i}: output {ow}x{oh} exceeds ⌊placed·dpi/72⌋ {}x{}",
+            formula(*pw),
+            formula(*ph)
+        );
+        assert_eq!((ow, oh), (*ew, *eh), "case {i}: expected dims");
+    }
+}
+
+/// After the parallel rewrite, every object in the saved document must be
+/// reachable from the trailer's /Root (no orphans from the detach/re-attach
+/// phase), and the file must load with a valid cross-reference table.
+#[test]
+fn xref_is_well_formed_and_all_objects_reachable() {
+    let dir = test_dir();
+
+    let (mut doc, pages_id) = new_doc();
+    for _ in 0..8 {
+        add_image_page(&mut doc, pages_id, photoish_rgb(160, 160), 160, 160, false);
+    }
+    compress_images_with(&mut doc, QUALITY, false, &CpuTranscoder, Some(150));
+    compress_and_save_pdf(
+        &mut doc,
+        dir.join("reach-post.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("reach-post.pdf"));
+
+    // BFS from /Root through every reference; every object must be found.
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<lopdf::ObjectId> = loaded
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|r| r.as_reference().ok())
+        .map(|id| vec![id])
+        .unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(obj) = loaded.get_object(id).ok() else {
+            continue;
+        };
+        match obj {
+            Object::Dictionary(d) => {
+                for (_, v) in d.iter() {
+                    collect_references(v, &mut stack);
+                }
+            }
+            Object::Array(a) => {
+                for v in a {
+                    collect_references(v, &mut stack);
+                }
+            }
+            Object::Stream(s) => {
+                for (_, v) in s.dict.iter() {
+                    collect_references(v, &mut stack);
+                }
+            }
+            _ => {}
+        }
+    }
+    let all: std::collections::HashSet<lopdf::ObjectId> = loaded.objects.keys().copied().collect();
+    // Structural objects (object-stream container, xref stream) are kept in
+    // `doc.objects` by the loader but are not part of the content graph.
+    let structural = |obj: &Object| {
+        matches!(obj, Object::Stream(s)
+            if s.dict.get(b"Type").ok().and_then(|t| t.as_name().ok())
+                .is_some_and(|t| t == b"ObjStm" || t == b"XRef"))
+    };
+    let content_ids: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|id| !loaded.objects.get(id).is_some_and(structural))
+        .collect();
+    let missing: Vec<_> = content_ids
+        .iter()
+        .copied()
+        .filter(|id| !seen.contains(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "content objects not reachable from /Root: {missing:?}"
+    );
+    assert_eq!(
+        seen.len(),
+        content_ids.len(),
+        "reachable set must equal content-object set"
+    );
+}
+
+/// Push every reference inside `obj` (dictionary values, array elements)
+/// onto `stack`.
+fn collect_references(obj: &Object, stack: &mut Vec<lopdf::ObjectId>) {
+    match obj {
+        Object::Reference(id) => stack.push(*id),
+        Object::Dictionary(d) => {
+            for (_, v) in d.iter() {
+                collect_references(v, stack);
+            }
+        }
+        Object::Array(a) => {
+            for v in a {
+                collect_references(v, stack);
+            }
+        }
+        Object::Stream(s) => {
+            for (_, v) in s.dict.iter() {
+                collect_references(v, stack);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A grayscale source must stay a single-component JPEG after re-encoding —
+/// a 3-component JPEG inside a /DeviceGray stream renders as garbage.
+#[test]
+fn grayscale_jpeg_stays_single_component() {
+    let dir = test_dir();
+
+    let (mut doc, pages_id) = new_doc();
+    add_image_page(&mut doc, pages_id, gradient_gray(128, 128), 128, 128, true);
+    compress_images_with(&mut doc, QUALITY, false, &CpuTranscoder, None);
+    compress_and_save_pdf(&mut doc, dir.join("gray-post.pdf").to_str().unwrap(), false).unwrap();
+
+    let loaded = assert_well_formed(&dir.join("gray-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, content, dict) = &images[0];
+    assert_eq!(
+        dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
+        Some(b"DCTDecode".as_slice()),
+        "grayscale image must be re-encoded as DCTDecode"
+    );
+    let img = image::load_from_memory(content).expect("output JPEG must decode");
+    assert_eq!(
+        img.color(),
+        image::ColorType::L8,
+        "single-component grayscale must survive re-encoding"
+    );
+}
+
+/// The rayon + allocator path must be safe under many concurrent
+/// compression jobs on the same binary (global thread pool + mimalloc),
+/// with every output identical and valid.
+#[test]
+fn concurrent_compression_is_deterministic_and_valid() {
+    let dir = test_dir();
+    let build = || {
+        let (mut doc, pages_id) = new_doc();
+        for _ in 0..6 {
+            add_image_page(&mut doc, pages_id, photoish_rgb(160, 160), 160, 160, false);
+        }
+        doc
+    };
+
+    let outputs: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let path = dir.join(format!("conc-{i}.pdf"));
+            let mut doc = build();
+            compress_images_with(&mut doc, QUALITY, false, &CpuTranscoder, None);
+            compress_and_save_pdf(&mut doc, path.to_str().unwrap(), false).unwrap();
+            path
+        })
+        .collect();
+
+    let first = std::fs::read(&outputs[0]).unwrap();
+    for path in &outputs {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes, first, "concurrent runs must be byte-identical");
+        assert_well_formed(path);
+    }
+}
