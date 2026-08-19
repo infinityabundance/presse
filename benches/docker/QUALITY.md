@@ -150,13 +150,17 @@ see below). Sizes at SSIM ≥ 0.9999 (300 dpi render) on sampled pages:
 
 | file | presse | qpdf | mutool | pdf-optimizer | gs /ebook |
 |---|---|---|---|---|---|
-| irs_fw2 scans (2.15 MB) | 2.03 (q50) / 1.92 (-d150) | **1.52** | 2.54 | 2.55 | 0.18¹ |
-| arxiv_gpt3 paper (6.77 MB) | 5.03 (q30) | 4.53 | **4.34** | 6.20 | 2.04¹ |
-| photos20 (12.08 MB, 72 dpi) | 7.65 (q30) | **6.22** | 6.38 | 10.58 | 12.07 (no-op) |
-| photos60 (36 MB, 60 imgs) | 22.96 (q30) | 18.67 | **6.76** (dedup) | 31.72 | 12.08 (no-op) |
+| irs_fw2 scans (2.15 MB) | 2.00 (q30) / 1.92 (-d150) | **1.52** | 2.54 | 2.55 | 0.18¹ |
+| arxiv_gpt3 paper (6.77 MB) | 3.53 (q30) | 4.53 | **4.34** | 6.20 | 2.04¹ |
+| photos20 (12.08 MB, 72 dpi) | 6.44 (q30) | **6.22** | 6.38 | 10.58 | 12.07 (no-op) |
+| photos60 (36 MB, 60 imgs) | **6.46** (q30, dedup) | 18.67 | 6.76 (dedup) | 31.72 | 12.08 (no-op) |
 
 ¹ below any full-res tool's size *because it down-samples* — native SSIM
 0.86 on the scans; on papers/photos it is a pass-through.
+
+The presse column is the **current** tree: the numbers in the size table of
+the 100-file RESULTS.md sweep (2.45× vs gs, etc.) are the pre-coalescing
+ones; the gap-closing work below is newer.
 
 Speed at the same fidelity (wall time, best-of-1):
 
@@ -170,13 +174,14 @@ Readings:
 
 - **At equal measured fidelity the full-res tools are visually
 equivalent** (SSIM 1.0000, native 0.9999+) — the frontier is decided by
-size and speed. qpdf is the size leader on scans; mutool's `-gggg`
-dedup wins duplicate-heavy documents (photos60 q30: 6.76 vs 18.67 MB);
-presse's parallel path is **4–70× faster** on image-heavy documents at
-the same fidelity (photos20/60: 0.25–0.26 s vs qpdf 0.99–2.93 s, mutool
-1.27–3.87 s, pdf-optimizer 5.9–17.8 s). qpdf is faster on a single-scan
-file (irs_fw2: 0.09 vs 0.16 s) — the speedup is the parallelized image
-phase, which only pays off with many images.
+size and speed. qpdf is the size leader on scans; presse's object
+coalescing (below) now closes the duplicate-heavy gap that used to belong
+to mutool's `-gggg` dedup (photos60 q30: **6.46 vs 6.76 MB**, presse vs
+mutool); presse's parallel path is **4–70× faster** on image-heavy
+documents at the same fidelity (photos20/60: 0.25–0.26 s vs qpdf
+0.99–2.93 s, mutool 1.27–3.87 s, pdf-optimizer 5.9–17.8 s). qpdf is
+faster on a single-scan file (irs_fw2: 0.09 vs 0.16 s) — the speedup is
+the parallelized image phase, which only pays off with many images.
 - **gs wins size only by removing pixels**, which only the native witness
 reveals — at equal *native* fidelity its /ebook output would sit at
 ~1.5–2.0 MB on the scans, next to qpdf.
@@ -192,6 +197,51 @@ is the 72 dpi render + native-image check, both 1.0000); quality numbers
 are page-render SSIM + image-level SSIM, not a full semantic-preservation
 court (ICC, annotations, forms, layers are validated by the qpdf/gs gates
 but not separately measured).
+
+## Closing the remaining Pareto size gaps
+
+Three measured losses against the comparators were investigated and closed
+(in one commit, `perf: close remaining Pareto compression gaps`):
+
+1. **Duplicate-heavy documents (mutool's `-gggg` win)** — the dedup cache
+already made identical images *encode* once; the missing half was that 60
+identical JPEG objects were still *stored* 60 times. A coalescing pass now
+groups image streams by semantically-equal dictionary + exact payload
+(`/Length` and the cosmetic `/Name` hint are ignored; indirect `/ColorSpace`
+and `/SMask` references are followed, so two byte-identical objects at
+different ids don't block dedup), keeps the lowest id, rewrites every
+reference, and drops the duplicates. photos60 q30: **22.96 → 6.46 MB**
+(below mutool's 6.76 MB) with zero visual change — the same pixels render
+from shared objects. Also helps any logo/watermark-heavy document.
+
+2. **qpdf scan gap** — irs_fw2's remaining images are *not* CMYK (the
+investigation that ruled CMYK out: every image is DeviceRGB); the gap is
+JPEG-encoder efficiency on the single photo image, which is an encoder
+lever, not a structural one. Out of scope here; the honest statement is
+that qpdf still holds the scan-size lead (1.52 vs 2.00 MB).
+
+3. **Flate-wrapped JPEG (OCRmyPDF's cheap trick)** — DCT bytes normally
+don't deflate, but padded/progressive JPEGs occasionally do; the
+`[FlateDecode, DCTDecode]` chain is applied only when the complete flate
+result is smaller. Small but free on every retained/re-encoded JPEG.
+
+4. **`--palette` (OCRmyPDF's paper win, default off)** — for plain 8-bit
+`DeviceRGB` raster streams (no mask / custom decode), a second candidate
+is built: an `/Indexed` color space (≤256-entry palette + one index byte
+per pixel, Flate-compressed). Exact palettes (≤256 unique colors) are
+lossless; larger rasters go through a deterministic median-cut quantizer
+and are accepted only above a 0.9999 native-image SSIM gate, so a lossy
+palette can never visibly degrade a figure. The smallest of original /
+JPEG / indexed wins per image. On the corpus it does not fire (the paper
+figures are already Flate-compressed and the >256-color ones fail the
+fidelity gate — their JPEG re-encode is *larger* than the source, so they
+stay untouched) — it is a safety-capped option for content stored in
+palette-unfriendly encodings, exercised by the regression suite's flat-
+figure fixture.
+
+Pareto sweep re-run on the four fixtures above after this commit: the
+`q30` presse column in the table is the new state; wall times are
+unchanged (the coalescing pass is a cheap serial map walk).
 
 ## The `-d` × `-s` matrix (quality × speed, vs the tools)
 

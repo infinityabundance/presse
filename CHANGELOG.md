@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Duplicate-image coalescing** — image streams that are semantically
+  identical (same dictionary, same payload; `/Length` and the cosmetic
+  `/Name` hint ignored, indirect `/ColorSpace`/`/SMask` references
+  followed) collapse onto one canonical object with every reference
+  rewritten. Documents embedding the same image many times shrink to the
+  unique content once (photos60 q30: 22.96 → 6.46 MB, below MuPDF's dedup
+  result, rendering unchanged).
+- **`--palette`** (`press --palette`, off by default) — an `/Indexed`
+  color-space candidate for eligible flat-color images (figures, charts,
+  scans): exact palette when ≤256 unique colors (lossless), deterministic
+  median-cut above that, accepted only above a 0.9999 native-image SSIM
+  gate; the smallest of original / JPEG / indexed wins per image.
+- **Flate-wrapped JPEG** — retained or re-encoded DCT streams that shrink
+  under zlib are stored as `[FlateDecode, DCTDecode]` when the full flate
+  result is smaller (OCRmyPDF-style trick).
 - **Parallel image re-encoding** — image streams are detached from the
   `Document`, re-encoded concurrently with rayon on owned buffers, and
   written back in a single serial pass (document-lock-free; only the dedup

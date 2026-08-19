@@ -19,8 +19,29 @@
 //!    `OnceLock` so competing workers converge on one encode (`get_or_init`
 //!    blocks the losers). A hash alone is never treated as equality — the
 //!    key compares the actual bytes.
+//! 4. **Coalescing** — after the apply pass, image streams that are
+//!    byte-identical (same dictionary, same payload) are collapsed onto one
+//!    object and every reference is rewritten to it. The dedup cache makes
+//!    identical images *encode* once; coalescing makes them *stored* once.
+//! 5. **`--palette`** — an opt-in `/Indexed` candidate for plain 8-bit
+//!    `DeviceRGB` rasters (default off): flat figures, charts and scans have
+//!    low chromatic entropy, so one index byte per pixel plus a ≤256-entry
+//!    table Flate-compresses far below what JPEG can reach. Exact palettes
+//!    (≤256 unique colors) are lossless; larger rasters go through a
+//!    deterministic median-cut quantizer and are accepted only above the
+//!    512-px native SSIM gate.
+//! 6. **Flate-wrapped JPEG** — OCRmyPDF's cheap trick: DCT bytes usually
+//!    don't deflate, but padded/progressive JPEGs occasionally do; the
+//!    `[FlateDecode, DCTDecode]` chain is used only when the complete flate
+//!    result is smaller.
 
-use lopdf::{Document, Object, ObjectId, Stream};
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
+
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use rayon::prelude::*;
 
 use crate::pdf::placements::{Placements, image_placements};
@@ -130,6 +151,7 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
         verbose,
         &CpuTranscoder,
         None,
+        false,
     );
 }
 
@@ -139,23 +161,27 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 /// `dpi`, when set, caps the effective resolution of every placed image:
 /// an image drawn at `w×h` points is downsampled to at most
 /// `w·dpi/72 × h·dpi/72` pixels (Ghostscript's `/ebook`-style behavior),
-/// and images already below the cap keep their source resolution. The
-/// pipeline is split in three phases:
+/// and images already below the cap keep their source resolution. `palette`
+/// additionally tries an `/Indexed` color-space candidate for eligible flat
+/// images and keeps the smallest of original / JPEG / indexed (default off:
+/// the JPEG-only pipeline). The pipeline is split in three phases:
 /// 1. **Extract** — detach every eligible image stream from the `Document`
 ///    object tree (serial, cheap: just map lookups + moves, no copies).
 /// 2. **Re-encode** — transcode all streams concurrently with rayon on owned,
 ///    detached buffers. No `Document` state is read or written from worker
 ///    threads, so there is nothing to lock.
 /// 3. **Apply** — write the re-encoded streams (and updated `/Filter` +
-///    `/Length`, plus `/Width` + `/Height` for downsampled images) dictionary
-///    entries back into the object tree in a single serial pass, right
-///    before serialization.
+///    `/Length`, plus `/Width` + `/Height` for downsampled images, and
+///    `/ColorSpace` + palette objects for indexed candidates) back into the
+///    object tree in a single serial pass, right before serialization. The
+///    pass ends by coalescing byte-identical image objects.
 pub fn compress_images_with<T: ImageTranscoder>(
     doc: &mut Document,
     mode: QualityMode,
     verbose: bool,
     transcoder: &T,
     dpi: Option<u32>,
+    palette: bool,
 ) {
     // Placement scan is needed only when downsampling is requested; without
     // it (the default) the pipeline is byte-identical to before.
@@ -190,27 +216,152 @@ pub fn compress_images_with<T: ImageTranscoder>(
     // Phase 2 — re-encode in parallel. Workers never touch `Document` state
     // (document-lock-free); the dedup cache is the only shared structure and
     // is internally synchronized.
-    let reencoded: Vec<(ObjectId, Stream)> = images
+    let reencoded: Vec<(ObjectId, Reencoded)> = images
         .into_par_iter()
         .map(|(id, stream)| {
-            let stream =
-                reencode_image_stream(id, stream, mode, verbose, &cache, transcoder, downsample);
-            (id, stream)
+            let outcome = reencode_image_stream(
+                id, stream, mode, verbose, &cache, transcoder, downsample, palette,
+            );
+            (id, outcome)
         })
         .collect();
 
-    // Phase 3 — single mutation pass back onto the document.
-    for (id, stream) in reencoded {
+    // Phase 3 — single mutation pass back onto the document. Indexed
+    // candidates need a fresh palette-stream object; identical palettes
+    // (identical images) share one object, so the coalescing pass below can
+    // collapse their streams onto one canonical image.
+    let mut palette_objects: HashMap<Arc<[u8]>, ObjectId> = HashMap::new();
+    for (id, outcome) in reencoded {
+        let stream = match outcome {
+            Reencoded::Stream(stream) => stream,
+            Reencoded::Indexed {
+                mut stream,
+                palette,
+                hival,
+                colorspace,
+            } => {
+                let key: Arc<[u8]> = Arc::from(palette);
+                let palette_id = match palette_objects.get(&key) {
+                    Some(pid) => *pid,
+                    None => {
+                        let mut p = Stream::new(dictionary! {}, zlib_encode(&key));
+                        p.dict.set(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+                        p.dict
+                            .set(b"Length", Object::Integer(p.content.len() as i64));
+                        let pid = doc.add_object(Object::Stream(p));
+                        palette_objects.insert(key, pid);
+                        pid
+                    }
+                };
+                stream.dict.set(
+                    b"ColorSpace",
+                    Object::Array(vec![
+                        Object::Name(b"Indexed".to_vec()),
+                        Object::Name(colorspace),
+                        Object::Integer(hival as i64),
+                        Object::Reference(palette_id),
+                    ]),
+                );
+                stream
+            }
+        };
         doc.objects.insert(id, Object::Stream(stream));
+    }
+
+    // Byte-identical image objects collapse onto one canonical object (the
+    // dedup cache already made them encode once; this makes them stored
+    // once). Rendering is unchanged: identical streams render identically,
+    // and PDF allows any number of pages to share one XObject.
+    let coalesced = coalesce_image_objects(doc);
+    verbose!(
+        verbose,
+        "[images] coalesced {} duplicate image object(s)",
+        coalesced
+    );
+}
+
+/// `--palette` fidelity gate: a lossy (median-cut) palette is accepted only
+/// above this native-image SSIM on a 512-px window — the project's stricter
+/// witness, not the 64-px render scale.
+const PALETTE_SSIM_GATE: f64 = 0.9999;
+
+/// Above this many unique colors the raster is photographic; median-cut
+/// quantization costs more than a palette can ever save, so it is skipped.
+const MAX_QUANTIZE_COLORS: usize = 65_536;
+
+/// Estimated PDF overhead of the extra palette stream + `/ColorSpace` array
+/// (dictionary + object entry), so the indexed candidate is chosen only when
+/// it *really* wins against the JPEG and the source.
+const PALETTE_OVERHEAD: usize = 96;
+
+/// The final outcome for one image stream, consumed by the apply pass.
+/// Workers never touch the `Document`; everything they need to hand back is
+/// carried in this value.
+enum Reencoded {
+    /// The stream is final (unchanged original, or a re-encode already
+    /// written into it by phase 2).
+    Stream(Stream),
+    /// The stream carries an indexed-color payload; phase 3 must create (or
+    /// reuse) a palette object and set `/ColorSpace` before insertion.
+    Indexed {
+        stream: Stream,
+        palette: Vec<u8>,
+        hival: u8,
+        colorspace: Vec<u8>,
+    },
+}
+
+/// The best replacement for one stream's content, already chosen by the
+/// size gate against the original bytes.
+enum Candidate {
+    /// Re-encoded JPEG payload, smaller than the source content.
+    Jpeg {
+        buf: Vec<u8>,
+        dims: Option<(u32, u32)>,
+    },
+    /// Indexed-color payload, smaller than the source content.
+    Indexed {
+        candidate: IndexedCandidate,
+        dims: Option<(u32, u32)>,
+    },
+    /// The source content wins; nothing replaced it.
+    Unchanged,
+}
+
+/// An `/Indexed` color-space candidate: a palette table plus one index byte
+/// per pixel. The palette is first-seen-ordered for exact palettes and
+/// box-ordered for median-cut palettes — deterministic either way, so
+/// serial and parallel runs stay byte-identical.
+struct IndexedCandidate {
+    /// Palette table bytes, 3 per entry (`DeviceRGB`).
+    palette: Vec<u8>,
+    /// Per-pixel palette indices, 1 byte each.
+    indices: Vec<u8>,
+    /// `hival` = palette length − 1 (must fit one byte).
+    hival: u8,
+    /// Base color space name (always `DeviceRGB` today).
+    colorspace: Vec<u8>,
+}
+
+impl IndexedCandidate {
+    /// Full cost of the indexed representation: indices (flate) + palette
+    /// (flate) + the dictionary/array overhead of the extra palette stream.
+    fn total_size(&self) -> usize {
+        zlib_encode(&self.indices).len() + zlib_encode(&self.palette).len() + PALETTE_OVERHEAD
     }
 }
 
 /// Re-encode a single image stream. The stream is owned and detached from the
 /// document, so this can run on any rayon worker thread.
 ///
-/// Returns the stream that should be stored back: the original, untouched,
-/// when nothing could or should be re-encoded; a modified copy carrying the
-/// new JPEG payload and updated `/Filter` + `/Length` entries otherwise.
+/// Returns the outcome that should be stored back: the original, untouched,
+/// when nothing could or should be re-encoded; a modified stream carrying the
+/// new JPEG payload (or an indexed candidate, described separately for the
+/// apply pass) otherwise.
+// The pipeline-wide context (mode/cache/transcoder/downsample/palette) is
+// deliberately passed as arguments rather than a bundle struct — callers are
+// generic over the transcoder and the function is internal.
+#[allow(clippy::too_many_arguments)]
 fn reencode_image_stream<T: ImageTranscoder>(
     id: ObjectId,
     mut stream: Stream,
@@ -219,7 +370,8 @@ fn reencode_image_stream<T: ImageTranscoder>(
     cache: &TranscodeCache,
     transcoder: &T,
     downsample: Option<Downsample<'_>>,
-) -> Stream {
+    palette: bool,
+) -> Reencoded {
     // Resolve `-q` / `-ssim` to the JPEG quality for this stream. In ssim
     // mode the calibration is deterministic, so the dedup key (which
     // includes the quality) stays valid.
@@ -297,7 +449,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
     // CMYK images not yet supported by image crate
     if color_space_raw == Some(b"DeviceCMYK") {
         verbose!(verbose, "[img {:?}] → skipped: CMYK not supported", id);
-        return stream;
+        return Reencoded::Stream(stream);
     }
 
     // Resolve the effective image filter.
@@ -319,19 +471,21 @@ fn reencode_image_stream<T: ImageTranscoder>(
                     names.join(", ")
                 );
             }
-            return stream;
+            return Reencoded::Stream(stream);
         }
         _ => None,
     };
+
+    let original_len = stream.content.len();
 
     // `resized_buf` outlives the borrow in the encode request below, so a
     // resampled raw stream's pixels stay alive across the cache lookup.
     // (Set only in the resample branch; read only right after.)
     let resized_buf: Option<Vec<u8>>;
 
-    // Re-encode, returning the new payload plus the dimensions it was
-    // written at (`None` = source dimensions, `Some` = downsampled).
-    let (buf, new_dims): (Vec<u8>, Option<(u32, u32)>) = match filter {
+    // Choose the best replacement for the stream's content: the JPEG, an
+    // indexed-color candidate, or the source itself (the size gate decides).
+    let candidate = match filter {
         Some(b"DCTDecode") | Some(b"JPXDecode") => {
             if let Some((tw, th)) = resampled {
                 verbose!(
@@ -351,29 +505,39 @@ fn reencode_image_stream<T: ImageTranscoder>(
                         "[img {:?}] → skipped: JPEG decode failed during resample",
                         id
                     );
-                    return stream;
+                    return Reencoded::Stream(stream);
                 };
                 let input = pixel_input(tag, tw, th, &bytes);
                 let key = encode_key(quality, tag, tw, th, &bytes);
                 let result = cache.get(key, || transcoder.transcode_image(&input, quality));
-                (
-                    match result.as_ref() {
-                        Ok(buf) if !buf.is_empty() => buf.clone(),
-                        Ok(_) => {
-                            verbose!(
-                                verbose,
-                                "[img {:?}] → skipped: backend produced empty output",
-                                id
-                            );
-                            return stream;
-                        }
-                        Err(e) => {
-                            verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
-                            return stream;
-                        }
+                match result.as_ref() {
+                    Ok(buf) if !buf.is_empty() && buf.len() < original_len => Candidate::Jpeg {
+                        buf: buf.clone(),
+                        dims: Some((tw, th)),
                     },
-                    Some((tw, th)),
-                )
+                    Ok(buf) if buf.is_empty() => {
+                        verbose!(
+                            verbose,
+                            "[img {:?}] → skipped: backend produced empty output",
+                            id
+                        );
+                        return Reencoded::Stream(stream);
+                    }
+                    Ok(buf) => {
+                        verbose!(
+                            verbose,
+                            "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
+                            id,
+                            buf.len(),
+                            original_len
+                        );
+                        Candidate::Unchanged
+                    }
+                    Err(e) => {
+                        verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                        return Reencoded::Stream(stream);
+                    }
+                }
             } else {
                 verbose!(verbose, "[img {:?}] → processing JPEG/JPX via backend", id);
                 // Identical JPEG bytes re-encode identically: encode once,
@@ -381,24 +545,34 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 let input = Input::Jpeg(&stream.content);
                 let key = encode_key(quality, 2, width, height, &stream.content);
                 let result = cache.get(key, || transcoder.transcode_image(&input, quality));
-                (
-                    match result.as_ref() {
-                        Ok(buf) if !buf.is_empty() => buf.clone(),
-                        Ok(_) => {
-                            verbose!(
-                                verbose,
-                                "[img {:?}] → skipped: backend produced empty output",
-                                id
-                            );
-                            return stream;
-                        }
-                        Err(e) => {
-                            verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
-                            return stream;
-                        }
+                match result.as_ref() {
+                    Ok(buf) if !buf.is_empty() && buf.len() < original_len => Candidate::Jpeg {
+                        buf: buf.clone(),
+                        dims: None,
                     },
-                    None,
-                )
+                    Ok(buf) if buf.is_empty() => {
+                        verbose!(
+                            verbose,
+                            "[img {:?}] → skipped: backend produced empty output",
+                            id
+                        );
+                        return Reencoded::Stream(stream);
+                    }
+                    Ok(buf) => {
+                        verbose!(
+                            verbose,
+                            "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
+                            id,
+                            buf.len(),
+                            original_len
+                        );
+                        Candidate::Unchanged
+                    }
+                    Err(e) => {
+                        verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                        return Reencoded::Stream(stream);
+                    }
+                }
             }
         }
         Some(other_filter) => {
@@ -418,7 +592,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
                         id,
                         e
                     );
-                    return stream;
+                    return Reencoded::Stream(stream);
                 }
             };
 
@@ -437,7 +611,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
                             width * height * 3
                         }
                     );
-                    return stream;
+                    return Reencoded::Stream(stream);
                 }
             };
 
@@ -511,24 +685,76 @@ fn reencode_image_stream<T: ImageTranscoder>(
             // must not share a cached JPEG.
             let key = encode_key(quality, tag, ew, eh, key_bytes);
             let result = cache.get(key, || transcoder.transcode_image(&input, quality));
-            (
-                match result.as_ref() {
-                    Ok(buf) if !buf.is_empty() => buf.clone(),
-                    Ok(_) => {
+            let jpeg: Option<Vec<u8>> = match result.as_ref() {
+                Ok(buf) if !buf.is_empty() => Some(buf.clone()),
+                Ok(_) => {
+                    verbose!(
+                        verbose,
+                        "[img {:?}] → skipped: backend produced empty output",
+                        id
+                    );
+                    None
+                }
+                Err(e) => {
+                    verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
+                    None
+                }
+            };
+
+            // `--palette`: an `/Indexed` candidate for plain 8-bit
+            // DeviceRGB rasters (see [`indexed_candidate`] for the why).
+            let indexed: Option<IndexedCandidate> =
+                if palette && palette_eligible(&stream, color_space_raw) {
+                    indexed_candidate(key_bytes, ew, eh)
+                } else {
+                    None
+                };
+
+            // The size gate: pick the smallest of JPEG / indexed / source.
+            match (jpeg, indexed) {
+                (Some(jpeg), Some(idx)) => {
+                    let (jlen, ilen) = (jpeg.len(), idx.total_size());
+                    if ilen < jlen && ilen < original_len {
+                        Candidate::Indexed {
+                            candidate: idx,
+                            dims: resampled,
+                        }
+                    } else if jlen < original_len {
+                        Candidate::Jpeg {
+                            buf: jpeg,
+                            dims: resampled,
+                        }
+                    } else {
                         verbose!(
                             verbose,
-                            "[img {:?}] → skipped: backend produced empty output",
-                            id
+                            "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
+                            id,
+                            jlen,
+                            original_len
                         );
-                        return stream;
+                        Candidate::Unchanged
                     }
-                    Err(e) => {
-                        verbose!(verbose, "[img {:?}] → skipped: transcode failed: {}", id, e);
-                        return stream;
-                    }
+                }
+                (Some(jpeg), None) if jpeg.len() < original_len => Candidate::Jpeg {
+                    buf: jpeg,
+                    dims: resampled,
                 },
-                resampled,
-            )
+                (Some(jpeg), None) => {
+                    verbose!(
+                        verbose,
+                        "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
+                        id,
+                        jpeg.len(),
+                        original_len
+                    );
+                    Candidate::Unchanged
+                }
+                (None, Some(idx)) if idx.total_size() < original_len => Candidate::Indexed {
+                    candidate: idx,
+                    dims: resampled,
+                },
+                (None, Some(_)) | (None, None) => Candidate::Unchanged,
+            }
         }
         None => {
             verbose!(
@@ -536,50 +762,71 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 "[img {:?}] → skipped: no Filter entry (uncompressed stream)",
                 id
             );
-            return stream;
+            return Reencoded::Stream(stream);
         }
     };
 
-    if buf.is_empty() {
-        verbose!(
-            verbose,
-            "[img {:?}] → skipped: JPEG encoding produced empty output",
-            id
-        );
-        return stream;
-    }
-
-    if buf.len() < stream.content.len() {
-        verbose!(
-            verbose,
-            "[img {:?}] → compressed {}B → {}B",
-            id,
-            stream.content.len(),
-            buf.len()
-        );
-        stream.content = buf;
-        stream
-            .dict
-            .set(b"Filter", Object::Name(b"DCTDecode".to_vec()));
-        stream
-            .dict
-            .set(b"Length", Object::Integer(stream.content.len() as i64));
-        if let Some((tw, th)) = new_dims {
-            // Downsampled: the raster is smaller, so the dict must say so.
-            stream.dict.set(b"Width", Object::Integer(tw as i64));
-            stream.dict.set(b"Height", Object::Integer(th as i64));
+    match candidate {
+        Candidate::Unchanged => {
+            // Retained content. A DCT stream can occasionally shrink under
+            // zlib (padded or progressive JPEG frames): use the
+            // `[FlateDecode, DCTDecode]` chain only when the full flate
+            // result is smaller.
+            try_flate_wrap(&mut stream);
+            Reencoded::Stream(stream)
         }
-    } else {
-        verbose!(
-            verbose,
-            "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
-            id,
-            buf.len(),
-            stream.content.len()
-        );
+        Candidate::Jpeg { buf, dims } => {
+            verbose!(
+                verbose,
+                "[img {:?}] → compressed {}B → {}B",
+                id,
+                original_len,
+                buf.len()
+            );
+            stream.content = buf;
+            stream
+                .dict
+                .set(b"Filter", Object::Name(b"DCTDecode".to_vec()));
+            stream
+                .dict
+                .set(b"Length", Object::Integer(stream.content.len() as i64));
+            if let Some((tw, th)) = dims {
+                // Downsampled: the raster is smaller, so the dict must say so.
+                stream.dict.set(b"Width", Object::Integer(tw as i64));
+                stream.dict.set(b"Height", Object::Integer(th as i64));
+            }
+            try_flate_wrap(&mut stream);
+            Reencoded::Stream(stream)
+        }
+        Candidate::Indexed { candidate, dims } => {
+            let payload = zlib_encode(&candidate.indices);
+            verbose!(
+                verbose,
+                "[img {:?}] → compressed {}B → {}B indexed ({} colors)",
+                id,
+                original_len,
+                payload.len(),
+                candidate.hival as usize + 1
+            );
+            stream.content = payload;
+            stream
+                .dict
+                .set(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+            stream
+                .dict
+                .set(b"Length", Object::Integer(stream.content.len() as i64));
+            if let Some((tw, th)) = dims {
+                stream.dict.set(b"Width", Object::Integer(tw as i64));
+                stream.dict.set(b"Height", Object::Integer(th as i64));
+            }
+            Reencoded::Indexed {
+                stream,
+                palette: candidate.palette,
+                hival: candidate.hival,
+                colorspace: candidate.colorspace,
+            }
+        }
     }
-
-    stream
 }
 
 /// A raw (decompressed) pixel buffer, classified into a backend-friendly
@@ -699,9 +946,598 @@ fn resize_raw(classified: &RawPixels<'_>, width: u32, height: u32, tw: u32, th: 
     }
 }
 
+/// zlib-compress bytes (PDF `/FlateDecode`) at the writer's compression
+/// level. Infallible on a `Vec` sink.
+fn zlib_encode(data: &[u8]) -> Vec<u8> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(9));
+    enc.write_all(data)
+        .expect("zlib write into a Vec cannot fail");
+    enc.finish().expect("zlib finish into a Vec cannot fail")
+}
+
+/// OCRmyPDF's cheap trick: DCT byte streams are Huffman-coded and normally
+/// incompressible, but JPEGs with zero-padded tails or progressive frames
+/// can occasionally shrink under zlib. The `[FlateDecode, DCTDecode]` chain
+/// is applied only when the complete flate result is smaller.
+fn try_flate_wrap(stream: &mut Stream) {
+    let is_plain_jpeg = stream
+        .dict
+        .get(b"Filter")
+        .ok()
+        .and_then(|f| f.as_name().ok())
+        .is_some_and(|f| f == b"DCTDecode");
+    if !is_plain_jpeg {
+        return;
+    }
+    let flate = zlib_encode(&stream.content);
+    if flate.len() < stream.content.len() {
+        stream.content = flate;
+        stream.dict.set(
+            b"Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"DCTDecode".to_vec()),
+            ]),
+        );
+        stream
+            .dict
+            .set(b"Length", Object::Integer(stream.content.len() as i64));
+    }
+}
+
+/// The `--palette` path is deliberately conservative: only plain 8-bit
+/// `DeviceRGB` raster streams without masks, custom decode tables or extra
+/// parameters. CMYK and ICCBased are excluded because the `/ColorSpace`
+/// must be a plain name; `DeviceGray` is excluded because 8-bit gray *is*
+/// its own palette — an indexed gray stream is byte-identical to the source
+/// plus palette overhead, so it can never pass the smaller-than-original
+/// gate.
+fn palette_eligible(stream: &Stream, color_space: Option<&[u8]>) -> bool {
+    if color_space != Some(b"DeviceRGB") {
+        return false;
+    }
+    for key in [
+        b"Mask".as_slice(),
+        b"SMask".as_slice(),
+        b"Decode".as_slice(),
+        b"DecodeParms".as_slice(),
+    ] {
+        if stream.dict.get(key).is_ok() {
+            return false;
+        }
+    }
+    matches!(
+        stream
+            .dict
+            .get(b"BitsPerComponent")
+            .ok()
+            .and_then(|b| b.as_i64().ok()),
+        None | Some(8)
+    )
+}
+
+/// Build the `/Indexed` candidate for an RGB raster, or `None` when the
+/// palette representation cannot reach the fidelity gate.
+///
+/// Mechanism (the OCRmyPDF paper win): plots, diagrams, charts and scans
+/// carry far less chromatic entropy than photos. A palette raster is one
+/// index byte per pixel plus a table of at most 256×3 bytes, so flat
+/// regions become runs of identical indices that Flate compresses into
+/// almost nothing — JPEG cannot exploit that structure, because it pays
+/// per-block overhead even on constant color. Images with at most 256
+/// unique colors are converted losslessly (exact palette); larger rasters
+/// go through a deterministic median-cut quantizer and are accepted only
+/// above the native-image SSIM gate, so a lossy palette can never visibly
+/// degrade a figure.
+fn indexed_candidate(rgb: &[u8], width: u32, height: u32) -> Option<IndexedCandidate> {
+    if rgb.len() < 3 {
+        return None;
+    }
+    let hist = build_histogram(rgb);
+    let unique = hist.colors.len();
+
+    if unique <= 256 {
+        // Lossless: the palette is the set of distinct colors, in
+        // first-seen order (deterministic).
+        let mut palette = Vec::with_capacity(unique * 3);
+        let mut index_of: HashMap<[u8; 3], u8> = HashMap::with_capacity(unique);
+        for (i, c) in hist.colors.iter().enumerate() {
+            index_of.insert(*c, i as u8);
+            palette.extend_from_slice(c);
+        }
+        let indices: Vec<u8> = rgb
+            .chunks_exact(3)
+            .map(|px| index_of[&[px[0], px[1], px[2]]])
+            .collect();
+        return Some(IndexedCandidate {
+            palette,
+            indices,
+            hival: (unique - 1) as u8,
+            colorspace: b"DeviceRGB".to_vec(),
+        });
+    }
+
+    // Photographic content: median-cut would cost more than a palette can
+    // ever save, so skip the candidate entirely.
+    if unique > MAX_QUANTIZE_COLORS {
+        return None;
+    }
+
+    let palette = median_cut(&hist);
+    let indices = map_to_palette(rgb, &palette);
+
+    // Fidelity gate: the quantized raster must be visually equivalent to
+    // the source at the native-image witness scale (512-px window).
+    let mapped: Vec<u8> = indices
+        .iter()
+        .flat_map(|&i| {
+            let c = palette[i as usize];
+            [c[0], c[1], c[2]]
+        })
+        .collect();
+    if ssim_window(rgb, &mapped, width, height) < PALETTE_SSIM_GATE {
+        return None;
+    }
+
+    let mut palette_bytes = Vec::with_capacity(palette.len() * 3);
+    for c in &palette {
+        palette_bytes.extend_from_slice(c);
+    }
+    Some(IndexedCandidate {
+        palette: palette_bytes,
+        indices,
+        hival: (palette.len() - 1) as u8,
+        colorspace: b"DeviceRGB".to_vec(),
+    })
+}
+
+/// Distinct 24-bit colors and their occurrence counts, in first-seen order.
+struct Histogram {
+    colors: Vec<[u8; 3]>,
+    counts: Vec<u32>,
+}
+
+fn build_histogram(rgb: &[u8]) -> Histogram {
+    let mut index: HashMap<[u8; 3], u32> = HashMap::new();
+    let mut colors = Vec::new();
+    let mut counts = Vec::new();
+    for px in rgb.chunks_exact(3) {
+        let c = [px[0], px[1], px[2]];
+        match index.entry(c) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                counts[*e.get() as usize] += 1;
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(colors.len() as u32);
+                colors.push(c);
+                counts.push(1);
+            }
+        }
+    }
+    Histogram { colors, counts }
+}
+
+/// Deterministic median-cut quantization of a histogram to ≤256 colors.
+/// Boxes are split along their longest channel at the count-weighted
+/// median; every tie is broken on the color bytes, so the output is
+/// reproducible run-to-run (serial and parallel runs stay byte-identical).
+fn median_cut(hist: &Histogram) -> Vec<[u8; 3]> {
+    let n = hist.colors.len();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    let mut boxes: Vec<(usize, usize)> = vec![(0, n)];
+
+    while boxes.len() < 256 {
+        let mut split = None;
+        'outer: for b in 0..boxes.len() {
+            let (lo, hi) = boxes[b];
+            if hi - lo < 2 {
+                continue;
+            }
+            let mut min_c = [255u8; 3];
+            let mut max_c = [0u8; 3];
+            for &ci in &order[lo..hi] {
+                let c = hist.colors[ci as usize];
+                for ch in 0..3 {
+                    min_c[ch] = min_c[ch].min(c[ch]);
+                    max_c[ch] = max_c[ch].max(c[ch]);
+                }
+            }
+            // Longest channel (ties resolve to the highest channel via
+            // `max_by_key`, which returns the last maximum).
+            let (channel, _) = (0..3)
+                .map(|ch| (ch, max_c[ch] as u32 - min_c[ch] as u32))
+                .max_by_key(|&(_, span)| span)
+                .expect("non-empty box");
+            if max_c[channel] == min_c[channel] {
+                continue; // all colors identical → unsplittable
+            }
+            order[lo..hi].sort_by(|&a, &b| {
+                let ca = hist.colors[a as usize];
+                let cb = hist.colors[b as usize];
+                ca[channel].cmp(&cb[channel]).then_with(|| ca.cmp(&cb))
+            });
+            let total: u64 = order[lo..hi]
+                .iter()
+                .map(|&ci| hist.counts[ci as usize] as u64)
+                .sum();
+            let mut acc = 0u64;
+            let mut cut = hi;
+            for (k, &ci) in order[lo..hi].iter().enumerate() {
+                acc += hist.counts[ci as usize] as u64;
+                if acc * 2 >= total {
+                    cut = lo + k + 1;
+                    break;
+                }
+            }
+            if cut <= lo || cut >= hi {
+                continue; // weighted median at the edge → unsplittable
+            }
+            boxes[b] = (lo, cut);
+            boxes.push((cut, hi));
+            split = Some(b);
+            break 'outer;
+        }
+        if split.is_none() {
+            break;
+        }
+    }
+
+    boxes
+        .iter()
+        .map(|&(lo, hi)| {
+            let mut sum = [0u64; 3];
+            let mut cnt = 0u64;
+            for &ci in &order[lo..hi] {
+                let c = hist.colors[ci as usize];
+                let w = hist.counts[ci as usize] as u64;
+                for ch in 0..3 {
+                    sum[ch] += c[ch] as u64 * w;
+                }
+                cnt += w;
+            }
+            [
+                (sum[0] / cnt) as u8,
+                (sum[1] / cnt) as u8,
+                (sum[2] / cnt) as u8,
+            ]
+        })
+        .collect()
+}
+
+/// Map every pixel to its nearest palette entry (squared RGB distance),
+/// memoized per distinct color so flat regions pay for the search once.
+fn map_to_palette(rgb: &[u8], palette: &[[u8; 3]]) -> Vec<u8> {
+    let mut memo: HashMap<[u8; 3], u8> = HashMap::new();
+    rgb.chunks_exact(3)
+        .map(|px| {
+            let c = [px[0], px[1], px[2]];
+            *memo.entry(c).or_insert_with(|| {
+                palette
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, p)| {
+                        let dr = p[0] as i32 - c[0] as i32;
+                        let dg = p[1] as i32 - c[1] as i32;
+                        let db = p[2] as i32 - c[2] as i32;
+                        dr * dr + dg * dg + db * db
+                    })
+                    .map(|(i, _)| i as u8)
+                    .unwrap_or(0)
+            })
+        })
+        .collect()
+}
+
+/// Mean luma SSIM between two equal-sized RGB rasters, on a window of at
+/// most 512 px on the long edge — the project's native-image witness scale
+/// (see `benches/docker/native_image_ssim.py`).
+fn ssim_window(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
+    let long = width.max(height);
+    let n = long.min(512);
+    let to_luma = |pixels: &[u8]| {
+        let img =
+            image::RgbImage::from_raw(width, height, pixels.to_vec()).expect("validated RGB dims");
+        let resized = image::imageops::resize(&img, n, n, image::imageops::FilterType::Triangle);
+        image::DynamicImage::ImageRgb8(resized).to_luma8()
+    };
+    let (a, b) = (to_luma(a), to_luma(b));
+    let count = (n * n) as f64;
+    let mean = |img: &image::GrayImage| img.pixels().map(|p| p[0] as f64).sum::<f64>() / count;
+    let (ma, mb) = (mean(&a), mean(&b));
+    let var = |img: &image::GrayImage, m: f64| {
+        img.pixels().map(|p| (p[0] as f64 - m).powi(2)).sum::<f64>() / count
+    };
+    let (va, vb) = (var(&a, ma), var(&b, mb));
+    let cov = a
+        .pixels()
+        .zip(b.pixels())
+        .map(|(x, y)| (x[0] as f64 - ma) * (y[0] as f64 - mb))
+        .sum::<f64>()
+        / count;
+    let c1 = (0.01f64 * 255.0).powi(2);
+    let c2 = (0.03f64 * 255.0).powi(2);
+    ((2.0 * ma * mb + c1) * (2.0 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+}
+
+/// Identity of one image stream for coalescing: canonical dict bytes (sans
+/// `/Length` and `/Name`) plus the exact payload.
+type ImageIdentity = (Arc<[u8]>, Arc<[u8]>);
+
+/// Collapse image streams that are semantically identical — same dictionary
+/// (modulo `/Length`, which is recomputed on save, and `/Name`, a cosmetic
+/// hint the page's resource key overrides) and same payload — onto one
+/// canonical object, and rewrite every reference to point at it. This is the
+/// *storage* half of duplicate handling: the dedup cache already made
+/// identical images encode once; this pass makes them be stored once.
+/// Rendering is unchanged — identical streams render identically, and PDF
+/// allows any number of pages to share one XObject.
+///
+/// Returns the number of redundant objects removed.
+fn coalesce_image_objects(doc: &mut Document) -> usize {
+    // Group image streams by (canonical dict bytes, payload).
+    let objects = &doc.objects;
+    let mut groups: HashMap<ImageIdentity, Vec<ObjectId>> = HashMap::new();
+    for (id, obj) in objects.iter() {
+        let Object::Stream(s) = obj else {
+            continue;
+        };
+        if !is_image_stream(s) {
+            continue;
+        }
+        let mut dict = s.dict.clone();
+        dict.remove(b"Length");
+        dict.remove(b"Name");
+        let mut canon = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        canonical_object(&Object::Dictionary(dict), &mut canon, objects, &mut visited);
+        groups
+            .entry((Arc::from(canon), Arc::from(s.content.as_slice())))
+            .or_default()
+            .push(*id);
+    }
+
+    let mut replace: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let mut removed = 0;
+    for group in groups.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        let canonical = *group.iter().min().expect("non-empty group");
+        for &dup in group.iter().filter(|&&d| d != canonical) {
+            replace.insert(dup, canonical);
+        }
+        removed += group.len() - 1;
+    }
+    if replace.is_empty() {
+        return 0;
+    }
+
+    // Rewrite every reference in the whole object graph and the trailer
+    // (not just objects reachable from /Root), so no dangling reference
+    // survives.
+    for (_, obj) in doc.objects.iter_mut() {
+        rewrite_references(obj, &replace);
+    }
+    for (_, v) in doc.trailer.iter_mut() {
+        rewrite_references(v, &replace);
+    }
+    for dup in replace.keys() {
+        doc.objects.remove(dup);
+    }
+    removed
+}
+
+fn rewrite_references(obj: &mut Object, replace: &HashMap<ObjectId, ObjectId>) {
+    match obj {
+        Object::Reference(id) => {
+            if let Some(new_id) = replace.get(id) {
+                *id = *new_id;
+            }
+        }
+        Object::Array(a) => {
+            for e in a.iter_mut() {
+                rewrite_references(e, replace);
+            }
+        }
+        Object::Dictionary(d) => {
+            for (_, v) in d.iter_mut() {
+                rewrite_references(v, replace);
+            }
+        }
+        Object::Stream(s) => {
+            for (_, v) in s.dict.iter_mut() {
+                rewrite_references(v, replace);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonical, order-independent serialization of a PDF object tree, used to
+/// group identical images for coalescing. Keys are sorted and every
+/// variable-length item is length-prefixed, so two dictionaries that are
+/// equal under PDF semantics always produce identical bytes regardless of
+/// key insertion order.
+///
+/// Indirect references are *followed*: two images whose `/ColorSpace` (or
+/// `/SMask`, `/DecodeParms`) entries point at separate objects with
+/// identical content are semantically identical — the reference ids are a
+/// serialization artifact, not a semantic difference. `visited` guards
+/// against reference cycles (path-based, so a shared object is
+/// canonicalized identically each time it is reached); a cycle or an
+/// unresolvable id falls back to the raw id bytes.
+fn canonical_object(
+    obj: &Object,
+    out: &mut Vec<u8>,
+    objects: &std::collections::BTreeMap<ObjectId, Object>,
+    visited: &mut std::collections::HashSet<ObjectId>,
+) {
+    match obj {
+        Object::Null => out.push(0),
+        Object::Boolean(b) => {
+            out.push(1);
+            out.push(u8::from(*b));
+        }
+        Object::Integer(i) => {
+            out.push(2);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Object::Real(f) => {
+            out.push(3);
+            out.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        Object::Name(n) => {
+            out.push(4);
+            out.extend_from_slice(&(n.len() as u32).to_le_bytes());
+            out.extend_from_slice(n);
+        }
+        Object::String(s, _) => {
+            out.push(5);
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s);
+        }
+        Object::Array(a) => {
+            out.push(7);
+            for e in a {
+                canonical_object(e, out, objects, visited);
+            }
+        }
+        Object::Dictionary(d) => {
+            out.push(8);
+            let mut entries: Vec<(&Vec<u8>, &Object)> = d.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in entries {
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(k);
+                canonical_object(v, out, objects, visited);
+            }
+        }
+        Object::Stream(s) => {
+            out.push(9);
+            let mut dict = s.dict.clone();
+            dict.remove(b"Length");
+            canonical_object(&Object::Dictionary(dict), out, objects, visited);
+            out.extend_from_slice(&(s.content.len() as u32).to_le_bytes());
+            out.extend_from_slice(&s.content);
+        }
+        Object::Reference((n, g)) => {
+            let id = (*n, *g);
+            if visited.insert(id) {
+                if let Some(target) = objects.get(&id) {
+                    canonical_object(target, out, objects, visited);
+                    visited.remove(&id);
+                    return;
+                }
+                visited.remove(&id);
+            }
+            // Unresolvable or cyclic: fall back to the raw id bytes.
+            out.push(10);
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&g.to_le_bytes());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::calibrated_quality;
+    use super::{build_histogram, calibrated_quality, indexed_candidate, median_cut};
+
+    /// A tiny photo-ish gradient with per-pixel noise (photographic content).
+    fn photoish(w: u32, h: u32) -> Vec<u8> {
+        let mut next: u64 = 42;
+        let mut v = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                next ^= next << 13;
+                next ^= next >> 7;
+                next ^= next << 17;
+                let n = (next & 0x1f) as u8;
+                let (r, g, b) = (
+                    (x as f32 / w as f32 * 255.0) as u8,
+                    (y as f32 / h as f32 * 255.0) as u8,
+                    (128.0 + 80.0 * ((x as f32 + y as f32) / 32.0).sin()) as u8,
+                );
+                v.extend_from_slice(&[r.wrapping_add(n), g.wrapping_add(n), b.wrapping_add(n)]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn palette_exact_is_lossless_and_reconstructs() {
+        // Flat figure: 4 solid colors -> exact palette, indices reproduce the
+        // source byte-for-byte (no fidelity gate needed).
+        let mut pixels = Vec::new();
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let c = match (x < 4, y < 4) {
+                    (true, true) => [255, 0, 0],
+                    (true, false) => [0, 255, 0],
+                    (false, true) => [0, 0, 255],
+                    (false, false) => [255, 255, 255],
+                };
+                pixels.extend_from_slice(&c);
+            }
+        }
+        let cand = indexed_candidate(&pixels, 8, 8).expect("flat figure must qualify");
+        assert_eq!(cand.palette.len(), 4 * 3, "4 unique colors");
+        assert_eq!(cand.hival, 3);
+        let rebuilt: Vec<u8> = cand
+            .indices
+            .iter()
+            .flat_map(|&i| {
+                let c = &cand.palette[i as usize * 3..i as usize * 3 + 3];
+                [c[0], c[1], c[2]]
+            })
+            .collect();
+        assert_eq!(rebuilt, pixels, "exact palette must be lossless");
+    }
+
+    #[test]
+    fn palette_median_cut_is_deterministic_and_gated() {
+        // A smooth gradient has many unique colors -> median-cut path. Two
+        // runs must produce identical palettes and indices (determinism, so
+        // serial and parallel runs stay byte-identical).
+        let (w, h) = (48u32, 48u32);
+        let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = [
+                    (x as f32 / w as f32 * 255.0) as u8,
+                    (y as f32 / h as f32 * 255.0) as u8,
+                    ((x as f32 + y as f32) / (w as f32 + h as f32) * 255.0) as u8,
+                ];
+                pixels.extend_from_slice(&c);
+            }
+        }
+        let hist = build_histogram(&pixels);
+        assert!(
+            hist.colors.len() > 256,
+            "gradient must exceed the exact limit"
+        );
+        let a = median_cut(&hist);
+        let b = median_cut(&hist);
+        assert_eq!(a, b, "median cut must be deterministic");
+        assert!(a.len() <= 256);
+
+        // The candidate itself may pass or fail the SSIM gate depending on
+        // how the palette samples the gradient; either way it must not panic
+        // and must produce a well-formed candidate or None.
+        let cand = indexed_candidate(&pixels, w, h);
+        if let Some(c) = cand {
+            assert_eq!(c.indices.len(), (w * h) as usize, "one index per pixel");
+        }
+    }
+
+    #[test]
+    fn palette_rejects_photoish_noise() {
+        // Photographic content (gradient + per-pixel noise) quantizes to
+        // banding; the 0.9999 native-SSIM gate must reject it, so photos can
+        // never be palette-converted.
+        let (w, h) = (64u32, 64u32);
+        let pixels = photoish(w, h);
+        assert!(indexed_candidate(&pixels, w, h).is_none());
+    }
 
     #[test]
     fn calibration_maps_ssim_targets_to_quality() {

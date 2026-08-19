@@ -88,6 +88,8 @@ def tool_settings(tools: list[str]) -> list[tuple[str, str, list[str]]]:
     out = []
     for q in QUALITIES:
         out.append(("presse", f"q{q}", ["{presse}", "press", "-q", str(q), "{in}", "-o", "{out}"]))
+        out.append(("presse", f"q{q}-palette", ["{presse}", "press", "-q", str(q), "--palette",
+                                                  "{in}", "-o", "{out}"]))
         out.append(("qpdf", f"q{q}", ["qpdf", "--optimize-images", f"--jpeg-quality={q}",
                                       "--object-streams=generate", "{in}", "{out}"]))
         out.append(("mutool", f"jpeg:{q}", ["mutool", "clean", "-i", "-gggg", "-z",

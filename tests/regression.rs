@@ -118,6 +118,35 @@ fn gradient_gray(w: u32, h: u32) -> Vec<u8> {
     v
 }
 
+/// Flat-color scientific-paper style figure: a handful of solid regions
+/// (few unique colors — the content class where an `/Indexed` palette
+/// beats JPEG).
+fn flat_figure_rgb(w: u32, h: u32) -> Vec<u8> {
+    const REGIONS: [[u8; 3]; 7] = [
+        [255, 255, 255], // paper
+        [0, 0, 0],       // ink
+        [31, 119, 180],  // blue
+        [255, 127, 14],  // orange
+        [44, 160, 44],   // green
+        [214, 39, 40],   // red
+        [148, 103, 189], // purple
+    ];
+    let mut v = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            // Colored bands with a solid top-left quadrant: flat regions,
+            // sharp edges, no gradients.
+            let c = if x < w / 2 && y < h / 2 {
+                REGIONS[1]
+            } else {
+                REGIONS[(x * 7 / w) as usize % 7]
+            };
+            v.extend_from_slice(&c);
+        }
+    }
+    v
+}
+
 // ---------------------------------------------------------------------------
 // Document builders (all synthetic, in-memory, deterministic)
 // ---------------------------------------------------------------------------
@@ -565,6 +594,32 @@ fn find_image_streams(doc: &Document) -> Vec<(lopdf::ObjectId, Vec<u8>, lopdf::D
         .collect()
 }
 
+/// True when a stream dict describes a DCT image: either a bare
+/// `/DCTDecode` name or the flate-wrapped `[FlateDecode, DCTDecode]` chain
+/// (the OCRmyPDF-style trick, applied only when the wrapped form is smaller).
+fn is_dct_filter(dict: &lopdf::Dictionary) -> bool {
+    match dict.get(b"Filter") {
+        Ok(Object::Name(n)) => n == b"DCTDecode",
+        Ok(Object::Array(a)) => {
+            let names: Vec<&[u8]> = a.iter().filter_map(|e| e.as_name().ok()).collect();
+            names == [b"FlateDecode".as_slice(), b"DCTDecode".as_slice()]
+        }
+        _ => false,
+    }
+}
+
+/// Inflate a flate-wrapped JPEG stream back to raw JPEG bytes (lopdf cannot
+/// decode DCTDecode, so the test applies the FlateDecode layer itself).
+fn unwrap_flate(content: &[u8]) -> Vec<u8> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    ZlibDecoder::new(content)
+        .read_to_end(&mut out)
+        .expect("flate-wrapped JPEG must inflate");
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -615,10 +670,9 @@ fn multi_image_roundtrip_is_well_formed_and_reencoded() {
             && s.dict.get(b"Subtype").and_then(|x| x.as_name()).ok() == Some(b"Image".as_slice())
         {
             image_count += 1;
-            assert_eq!(
-                s.dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
-                Some(b"DCTDecode".as_slice()),
-                "re-encodable image must end up as DCTDecode"
+            assert!(
+                is_dct_filter(&s.dict),
+                "re-encodable image must end up as a DCTDecode stream"
             );
             assert_eq!(
                 s.dict.get(b"Length").and_then(|l| l.as_i64()).ok(),
@@ -626,7 +680,13 @@ fn multi_image_roundtrip_is_well_formed_and_reencoded() {
             );
         }
     }
-    assert_eq!(image_count, 12, "all 12 images must be re-encoded");
+    // The 12 pages carry 6 unique pixel sets, each used twice; coalescing
+    // collapses the byte-identical duplicates onto one object per unique
+    // image (12 pages still render — `get_pages` above proves it).
+    assert_eq!(
+        image_count, 6,
+        "12 pages must collapse to 6 unique image objects"
+    );
 
     assert_visual_similarity(&dir, "multi", 0.90);
 }
@@ -805,9 +865,9 @@ fn rgba4_stream_is_normalized_in_chunks() {
             && s.dict.get(b"Subtype").and_then(|x| x.as_name()).ok() == Some(b"Image".as_slice())
         {
             reencoded += 1;
-            assert_eq!(
-                s.dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
-                Some(b"DCTDecode".as_slice())
+            assert!(
+                is_dct_filter(&s.dict),
+                "4-byte/px stream must be re-encoded as DCT"
             );
             assert_eq!(
                 s.dict.get(b"Width").and_then(|w| w.as_i64()).ok(),
@@ -983,6 +1043,7 @@ fn dpi_downsampling_resizes_placed_images_and_updates_dims() {
         false,
         &CpuTranscoder,
         Some(150),
+        false,
     );
     compress_and_save_pdf(
         &mut post.0,
@@ -1005,9 +1066,8 @@ fn dpi_downsampling_resizes_placed_images_and_updates_dims() {
         Some(208),
         "/Height must reflect the resampled raster"
     );
-    assert_eq!(
-        dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
-        Some(b"DCTDecode".as_slice()),
+    assert!(
+        is_dct_filter(dict),
         "resampled image must be re-encoded as DCTDecode"
     );
 
@@ -1037,6 +1097,7 @@ fn dpi_above_effective_resolution_keeps_source_size() {
         false,
         &CpuTranscoder,
         Some(600),
+        false,
     );
     compress_and_save_pdf(
         &mut doc.0,
@@ -1152,6 +1213,7 @@ fn gpu_failure_falls_back_to_cpu_identically() {
         false,
         &fallback,
         None,
+        false,
     );
 
     let (cpu_path, fb_path) = (
@@ -1316,6 +1378,7 @@ fn cpu_transcoder_default_parity() {
         false,
         &CpuTranscoder,
         None,
+        false,
     );
 
     let (p_path, e_path) = (
@@ -1361,6 +1424,7 @@ fn dpi_cap_never_upscales_and_matches_formula() {
             false,
             &CpuTranscoder,
             Some(*dpi),
+            false,
         );
         compress_and_save_pdf(
             &mut doc.0,
@@ -1406,6 +1470,7 @@ fn xref_is_well_formed_and_all_objects_reachable() {
         false,
         &CpuTranscoder,
         Some(150),
+        false,
     );
     compress_and_save_pdf(
         &mut doc,
@@ -1518,6 +1583,7 @@ fn grayscale_jpeg_stays_single_component() {
         false,
         &CpuTranscoder,
         None,
+        false,
     );
     compress_and_save_pdf(&mut doc, dir.join("gray-post.pdf").to_str().unwrap(), false).unwrap();
 
@@ -1525,12 +1591,15 @@ fn grayscale_jpeg_stays_single_component() {
     let images = find_image_streams(&loaded);
     assert_eq!(images.len(), 1);
     let (_, content, dict) = &images[0];
-    assert_eq!(
-        dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
-        Some(b"DCTDecode".as_slice()),
+    assert!(
+        is_dct_filter(dict),
         "grayscale image must be re-encoded as DCTDecode"
     );
-    let img = image::load_from_memory(content).expect("output JPEG must decode");
+    let jpeg = match dict.get(b"Filter") {
+        Ok(Object::Array(_)) => unwrap_flate(content),
+        _ => content.clone(),
+    };
+    let img = image::load_from_memory(&jpeg).expect("output JPEG must decode");
     assert_eq!(
         img.color(),
         image::ColorType::L8,
@@ -1562,6 +1631,7 @@ fn concurrent_compression_is_deterministic_and_valid() {
                 false,
                 &CpuTranscoder,
                 None,
+                false,
             );
             compress_and_save_pdf(&mut doc, path.to_str().unwrap(), false).unwrap();
             path
@@ -1589,7 +1659,7 @@ fn ssim_target_reduces_size_and_stays_valid() {
         for _ in 0..4 {
             add_image_page(&mut doc.0, doc.1, gradient_gray(256, 256), 256, 256, true);
         }
-        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None);
+        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None, false);
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         std::fs::metadata(dir.join(name)).unwrap().len()
     };
@@ -1615,7 +1685,7 @@ fn ssim_one_keeps_default_quality() {
     let run = |mode: QualityMode, name: &str| {
         let mut doc = new_doc();
         add_image_page(&mut doc.0, doc.1, photoish_rgb(200, 200), 200, 200, false);
-        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None);
+        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None, false);
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         std::fs::read(dir.join(name)).unwrap()
     };
@@ -1647,7 +1717,7 @@ fn dpi_and_ssim_compose() {
             false,
             (200.0, 200.0),
         );
-        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, dpi);
+        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, dpi, false);
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         let loaded = Document::load(dir.join(name)).unwrap();
         let (_, _, dict) = &find_image_streams(&loaded)[0];
@@ -1679,4 +1749,153 @@ fn dpi_and_ssim_compose() {
         "composed dpi+ssim must beat each knob alone: base {base_size}, d {d_size}, s {s_size}, ds {ds_size}"
     );
     assert_well_formed(&dir.join("compose-ds.pdf"));
+}
+
+/// Three byte-identical image objects must collapse to one canonical object
+/// after compression (the *storage* half of duplicate handling; the dedup
+/// cache is the *encode* half), and the page must render identically.
+#[test]
+fn duplicate_image_objects_collapse_to_one() {
+    let dir = test_dir();
+    let (mut doc, pages_id) = new_doc();
+    let pixels = photoish_rgb(96, 96);
+    for _ in 0..3 {
+        add_image_page(&mut doc, pages_id, pixels.clone(), 96, 96, false);
+    }
+    save_pdf(&mut doc, dir.join("dedup-pre.pdf").to_str().unwrap()).unwrap();
+
+    compress_images(&mut doc, QUALITY, false);
+    compress_and_save_pdf(
+        &mut doc,
+        dir.join("dedup-post.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("dedup-post.pdf"));
+    assert_eq!(
+        count_image_streams(&loaded),
+        1,
+        "identical image objects must collapse to one canonical object"
+    );
+    assert_visual_similarity(&dir, "dedup", 0.99);
+}
+
+/// `--palette` must convert a flat-color figure to `/Indexed` +
+/// `/FlateDecode` (with a palette-stream object in `/ColorSpace`), produce a
+/// smaller file than the JPEG-only run, and still render identically.
+#[test]
+fn flat_figure_with_palette_flag_becomes_indexed() {
+    let dir = test_dir();
+
+    let (mut pre, pages_id) = new_doc();
+    add_image_page(
+        &mut pre,
+        pages_id,
+        flat_figure_rgb(256, 256),
+        256,
+        256,
+        false,
+    );
+    save_pdf(&mut pre, dir.join("flat-pre.pdf").to_str().unwrap()).unwrap();
+
+    let build = |palette: bool, name: &str| {
+        let (mut doc, pages_id) = new_doc();
+        add_image_page(
+            &mut doc,
+            pages_id,
+            flat_figure_rgb(256, 256),
+            256,
+            256,
+            false,
+        );
+        compress_images_with(
+            &mut doc,
+            QualityMode::fixed(QUALITY),
+            false,
+            &CpuTranscoder,
+            None,
+            palette,
+        );
+        compress_and_save_pdf(&mut doc, dir.join(name).to_str().unwrap(), false).unwrap();
+    };
+    build(false, "flat-jpeg.pdf");
+    build(true, "flat-post.pdf");
+
+    let (jpeg_size, pal_size) = (
+        std::fs::metadata(dir.join("flat-jpeg.pdf")).unwrap().len(),
+        std::fs::metadata(dir.join("flat-post.pdf")).unwrap().len(),
+    );
+    assert!(
+        pal_size < jpeg_size,
+        "--palette must beat JPEG on a flat figure: {pal_size} vs {jpeg_size}"
+    );
+
+    let loaded = assert_well_formed(&dir.join("flat-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, _, dict) = &images[0];
+    assert_eq!(
+        dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
+        Some(b"FlateDecode".as_slice()),
+        "indexed image must stay FlateDecode"
+    );
+    let cs = dict
+        .get(b"ColorSpace")
+        .and_then(|c| c.as_array())
+        .expect("/ColorSpace");
+    assert_eq!(
+        cs[0].as_name().ok(),
+        Some(b"Indexed".as_slice()),
+        "ColorSpace must be [/Indexed /DeviceRGB hival <palette stream>]"
+    );
+    assert_eq!(cs[1].as_name().ok(), Some(b"DeviceRGB".as_slice()));
+    assert!(
+        cs[3].as_reference().is_ok(),
+        "palette must be an indirect stream"
+    );
+
+    assert_visual_similarity(&dir, "flat", 0.99);
+}
+
+/// `--palette` must not touch photographic content: photos still become
+/// JPEG (`DCTDecode`), never `/Indexed`.
+#[test]
+fn photo_with_palette_flag_stays_jpeg() {
+    let dir = test_dir();
+    let (mut pre, pages_id) = new_doc();
+    add_image_page(&mut pre, pages_id, photoish_rgb(160, 160), 160, 160, false);
+    save_pdf(&mut pre, dir.join("photo-pal-pre.pdf").to_str().unwrap()).unwrap();
+
+    let (mut doc, pages_id) = new_doc();
+    add_image_page(&mut doc, pages_id, photoish_rgb(160, 160), 160, 160, false);
+    compress_images_with(
+        &mut doc,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder,
+        None,
+        true,
+    );
+    compress_and_save_pdf(
+        &mut doc,
+        dir.join("photo-pal-post.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("photo-pal-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, _, dict) = &images[0];
+    assert!(
+        is_dct_filter(dict),
+        "photographic content must keep the JPEG path under --palette"
+    );
+    assert_eq!(
+        dict.get(b"ColorSpace").and_then(|c| c.as_name()).ok(),
+        Some(b"DeviceRGB".as_slice()),
+        "ColorSpace must stay a plain DeviceRGB name"
+    );
+    assert_visual_similarity(&dir, "photo-pal", 0.95);
 }

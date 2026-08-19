@@ -28,6 +28,7 @@ fuzz_target!(|data: &[u8]| {
         false,
         &presse::transcode::CpuTranscoder,
         None,
+        false,
     );
     let _ = compress_and_save_pdf(&mut doc, OUT, false);
     let Ok(mut doc2) = lopdf::Document::load_mem(data) else {
@@ -35,4 +36,18 @@ fuzz_target!(|data: &[u8]| {
     };
     compress_images(&mut doc2, 50, false);
     let _ = compress_and_save_pdf(&mut doc2, OUT, false);
+    // Exercise the `--palette` candidate path as well (coalescing, the
+    // indexed-candidate builder and the median-cut quantizer all run).
+    let Ok(mut doc3) = lopdf::Document::load_mem(data) else {
+        return;
+    };
+    compress_images_with(
+        &mut doc3,
+        QualityMode::fixed(50),
+        false,
+        &presse::transcode::CpuTranscoder,
+        None,
+        true,
+    );
+    let _ = compress_and_save_pdf(&mut doc3, OUT, false);
 });

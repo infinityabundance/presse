@@ -61,6 +61,28 @@ pub enum Commands {
         )]
         ssim: Option<f64>,
 
+        /// Also try an indexed-color (/Indexed) palette representation for
+        /// eligible flat-color images and keep the smallest candidate.
+        #[arg(
+            long,
+            default_value_t = false,
+            long_help = "For each eligible flat-color image (plain 8-bit DeviceRGB raster with
+no mask or custom decode table), also build an indexed-color (/Indexed +
+/FlateDecode) candidate alongside the JPEG one, and keep the smallest of
+original / JPEG / indexed.
+
+Palettes win where JPEG cannot: figures, charts, diagrams, screenshots
+and scans have little chromatic entropy, so one index byte per pixel plus
+a <=256-entry table Flate-compresses far below a JPEG. Images with at
+most 256 unique colors are converted losslessly; larger rasters are
+median-cut and accepted only above a 0.9999 native-image SSIM gate, so a
+lossy palette can never visibly degrade the figure. Photos effectively
+never qualify and keep the JPEG path.
+
+Default (flag omitted): JPEG-only pipeline, current behavior."
+        )]
+        palette: bool,
+
         // Details during the compression process --> sizes comparison before & after
         #[arg(short, long, default_value_t = false)]
         verbose: bool,

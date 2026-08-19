@@ -123,6 +123,7 @@ presse merge *.png *.pdf
 | `-q, --quality` | `80` | Image recompression quality (0–100) |
 | `-d, --dpi` | source resolution | Cap placed image resolution to DPI pixels/inch (75 screen, 150 ebook, 300 printer, 600 prepress); omitted = keep source resolution |
 | `-s, --ssim` | `1.0` | Target output fidelity as measured SSIM (calibrated on grainy scans — the worst case for JPEG — so smoother content exceeds the target); lower = smaller and faster. `1.0` = use `-q` as given |
+| `--palette` | `false` | Also build an `/Indexed` palette candidate for eligible flat-color images (figures, charts, scans) and keep the smallest of original / JPEG / indexed; exact palettes are lossless, lossy ones are gated on 0.9999 native SSIM |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -139,7 +140,34 @@ resolution. Only `press` takes the flag today.
 presse press big.pdf -o small.pdf -d 150   # ~ebook: 150 dpi cap
 presse press scans.pdf -d 75               # ~screen: 75 dpi cap
 presse press deck.pdf -s 0.86              # ~q9: fidelity-targeted, 60% smaller on photos
+presse press figures.pdf --palette         # also try indexed-color palettes
 ```
+
+### Duplicate-image collapsing and palette quantization
+
+Two structural optimizations are always on:
+
+- **Coalescing** — after re-encoding, image streams that are semantically
+  identical (same dictionary and same payload) collapse onto one object,
+  and every reference is rewritten to it. Documents that embed the same
+  photo, logo, watermark or figure many times (60 photos that are really
+  20 unique images × 3 copies) shrink to the unique content once — e.g.
+  22.96 → 6.46 MB at `-q 30` on the photos60 corpus file, below MuPDF's
+  dedup result, with identical rendering.
+- **Flate-wrapped JPEG** — DCT streams are normally incompressible, but
+  padded/progressive JPEGs occasionally shrink under zlib; the
+  `[FlateDecode, DCTDecode]` chain is used only when the full flate result
+  is smaller.
+
+`--palette` (off by default) additionally tries an `/Indexed` color-space
+candidate for eligible flat-color images: one index byte per pixel plus a
+≤256-entry palette, Flate-compressed — the representation that beats JPEG
+on figures, charts, diagrams and screenshots. Images with ≤256 unique
+colors convert losslessly; larger rasters go through a deterministic
+median-cut quantizer and are accepted only above a 0.9999 native-image SSIM
+gate, so a lossy palette can never visibly degrade a figure. Photos
+effectively never qualify. The smallest of original / JPEG / indexed wins
+per image. Only `press` takes the flag today.
 
 ### Merge — `presse merge`
 

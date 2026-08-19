@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             acceleration,
             dpi,
             ssim,
+            palette,
             verbose,
         } => {
             // Resolve the transcoding backend up front: requesting a backend
@@ -91,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     verbose,
                     &transcoder,
                     dpi,
+                    palette,
                 );
 
                 // Compressing the document

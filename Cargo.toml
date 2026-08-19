@@ -60,6 +60,8 @@ mimalloc = "0.1"
 # Same major/minor as the main deps, shared by tests/ and examples/ (corpus generator)
 lopdf = "0.44"
 image = "0.25"
+# Test-side inflate of flate-wrapped JPEG streams (lopdf cannot decode DCTDecode).
+flate2 = "1.1"
 
 # The profile that 'dist' will build with
 [profile.dist]
