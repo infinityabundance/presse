@@ -12,7 +12,9 @@ non-compressing Rust tools unpdf and pdfrs — see [`QUALITY.md`](QUALITY.md).
 The engine uses: rayon for concurrent image re-encoding, `mimalloc` as the
 global allocator, the `zlib-rs` deflate backend for flate2 (pure Rust),
 memory-mapped input reads, and a re-encode cache that deduplicates identical
-image streams (hashed pixel input; one JPEG encode serves every duplicate).
+image streams — keyed by quality, input kind, dimensions, and exact pixel
+bytes, with one JPEG encode serving every duplicate (including duplicates
+found simultaneously by parallel workers).
 
 Build note: the figures below describe a glibc build with `mimalloc` and
 `-C target-cpu=native`. The x86_64 Linux release artifact is the musl build;

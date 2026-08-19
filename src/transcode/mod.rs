@@ -1,7 +1,10 @@
 //! Pluggable image transcoding backends.
 //!
-//! The default [`CpuTranscoder`] is the rayon + 32 KiB chunked SIMD engine
-//! and is the only backend linked into default builds — zero GPU
+//! The default [`CpuTranscoder`] is a rayon-parallel JPEG re-encoder — the
+//! only explicit fixed-size block loop is the RGBA→RGB normalization pass;
+//! there is no hand-written SIMD, the codecs are `image`-crate based and may
+//! use SIMD internally, and `-C target-cpu=native` lets LLVM auto-vectorize
+//! the rest. It is the only backend linked into default builds — zero GPU
 //! dependencies and zero dynamic dispatch on the default path (callers are
 //! generic over [`ImageTranscoder`], so the CPU backend monomorphizes).
 //!
@@ -20,9 +23,8 @@
 //! production.
 
 use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -355,24 +357,77 @@ pub(crate) fn encode_jpeg(out: &mut Vec<u8>, img: &image::DynamicImage, quality:
     }
 }
 
-/// Key for the transcode dedup cache: target quality + a path tag (1 = luma,
-/// 2 = jpeg, 3 = rgb) + the exact encoder-input bytes.
-pub(crate) fn encode_key(quality: u8, tag: u8, bytes: &[u8]) -> u64 {
-    let mut h = ahash::AHasher::default();
-    h.write_u8(quality);
-    h.write_u8(tag);
-    bytes.hash(&mut h);
-    h.finish()
+/// Semantic identity of one transcode request: everything that determines
+/// the output JPEG, independent of which object happened to carry the
+/// pixels.
+///
+/// The identity is the *encoder input*, not the source stream — two streams
+/// that decode to identical pixels at the same size share one entry and one
+/// encode (e.g. a `/FlateDecode` and an `/LZWDecode` twin, or a 4-byte
+/// `DeviceRGB` stream normalized to 3 bytes). Width and height are part of
+/// the key because two images can carry identical pixel bytes at different
+/// dimensions (RGB 10×10 and RGB 20×5 are both 300 bytes) and must still
+/// emit JPEGs with their own headers. Equality is decided on the exact
+/// content bytes, never on a hash alone: the map may hash the key for
+/// placement, but a hash collision can never substitute one image's JPEG for
+/// another's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey {
+    /// Target quality.
+    quality: u8,
+    /// Input kind: 1 = luma pixels, 2 = JPEG bytes, 3 = RGB pixels. Pins
+    /// the encoder-input pixel format together with the content bytes.
+    kind: u8,
+    /// Raster width of the encoder input.
+    width: u32,
+    /// Raster height of the encoder input.
+    height: u32,
+    /// Exact encoder-input bytes (content identity).
+    content: Arc<[u8]>,
+}
+
+/// Build a [`CacheKey`] for one transcode request.
+pub(crate) fn encode_key(quality: u8, kind: u8, width: u32, height: u32, bytes: &[u8]) -> CacheKey {
+    CacheKey {
+        quality,
+        kind,
+        width,
+        height,
+        content: Arc::from(bytes),
+    }
 }
 
 /// Shared handle for caching transcode results across duplicate streams.
 /// Empty buffers and errors are cached too, so every duplicate image object
 /// reproduces the same decision without re-running the backend.
+///
+/// The map lock is held only for the find-or-insert of the (cheap) entry;
+/// the encode itself runs outside it, and the per-entry [`OnceLock`] makes
+/// the first producer's result visible to every worker that raced on the
+/// same key — `get_or_init` blocks the losers until the winner finishes, so
+/// a given key is computed exactly once even under full contention.
 pub(crate) struct TranscodeCache {
     map: std::sync::Mutex<CacheMap>,
 }
 
-type CacheMap = std::collections::HashMap<u64, Arc<Result<Vec<u8>, TranscodeError>>>;
+type CacheMap = std::collections::HashMap<CacheKey, Entry>;
+
+/// One cached transcode result, shared by every worker that hit the same key.
+type CachedResult = Arc<Result<Vec<u8>, TranscodeError>>;
+
+struct Entry {
+    /// `OnceLock` for once-only production; the outer `Arc` is the handle we
+    /// can take out of the map lock so callers never hold it while encoding.
+    value: Arc<OnceLock<CachedResult>>,
+}
+
+impl Entry {
+    fn new() -> Self {
+        Self {
+            value: Arc::new(OnceLock::new()),
+        }
+    }
+}
 
 impl TranscodeCache {
     pub(crate) fn new() -> Self {
@@ -383,25 +438,23 @@ impl TranscodeCache {
 
     pub(crate) fn get(
         &self,
-        key: u64,
+        key: CacheKey,
         produce: impl FnOnce() -> Result<Vec<u8>, TranscodeError>,
     ) -> Arc<Result<Vec<u8>, TranscodeError>> {
-        if let Some(hit) = self.map.lock().unwrap().get(&key) {
-            return Arc::clone(hit);
-        }
-        let produced = Arc::new(produce());
-        self.map
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&produced));
-        produced
+        let value = {
+            let mut guard = self.map.lock().unwrap();
+            Arc::clone(&guard.entry(key).or_insert_with(Entry::new).value)
+        };
+        Arc::clone(value.get_or_init(|| Arc::new(produce())))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::jpeg_components;
+    use super::{TranscodeCache, TranscodeError, encode_key};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Build a minimal JPEG with the given component count by emitting a
     /// scan-less frame header (SOF0) after SOI.
@@ -436,5 +489,114 @@ mod tests {
         assert_eq!(jpeg_components(&b), Some(3));
         assert_eq!(jpeg_components(b"not a jpeg"), None);
         assert_eq!(jpeg_components(&[]), None);
+    }
+
+    #[test]
+    fn cache_key_distinguishes_dimensions_with_identical_bytes() {
+        // RGB 10×10 and RGB 20×5 both hold 300 identical bytes; their keys
+        // must differ so a cached 10×10 JPEG is never handed to the 20×5
+        // image (each would carry the wrong /Width /Height header).
+        let bytes = vec![7u8; 300];
+        let a = encode_key(50, 3, 10, 10, &bytes);
+        let b = encode_key(50, 3, 20, 5, &bytes);
+        assert_ne!(a, b);
+
+        // and the cache keeps them as distinct entries
+        let cache = TranscodeCache::new();
+        let ra = cache.get(a, || Ok(vec![1]));
+        let rb = cache.get(b, || Ok(vec![2]));
+        assert_eq!(ra.as_ref().as_deref().unwrap(), &[1][..]);
+        assert_eq!(rb.as_ref().as_deref().unwrap(), &[2][..]);
+    }
+
+    #[test]
+    fn cache_key_distinguishes_quality_kind_and_content() {
+        let bytes = vec![7u8; 12];
+        let other = vec![8u8; 12];
+        assert_ne!(
+            encode_key(30, 3, 4, 3, &bytes),
+            encode_key(50, 3, 4, 3, &bytes)
+        );
+        assert_ne!(
+            encode_key(50, 1, 4, 3, &bytes),
+            encode_key(50, 3, 4, 3, &bytes)
+        );
+        assert_ne!(
+            encode_key(50, 3, 4, 3, &bytes),
+            encode_key(50, 3, 4, 3, &other)
+        );
+    }
+
+    #[test]
+    fn cache_produces_once_for_repeated_keys() {
+        let cache = TranscodeCache::new();
+        let produced = AtomicUsize::new(0);
+        let key = encode_key(50, 3, 4, 3, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        for _ in 0..4 {
+            let r = cache.get(key.clone(), || {
+                produced.fetch_add(1, Ordering::SeqCst);
+                Ok(b"jpeg".to_vec())
+            });
+            assert_eq!(r.as_ref().as_deref().unwrap(), b"jpeg");
+        }
+        assert_eq!(produced.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_converges_on_one_computation_under_contention() {
+        // Workers that race on the same key must all converge on the single
+        // encode the winner performs, not each run their own.
+        let cache = TranscodeCache::new();
+        let produced = Arc::new(AtomicUsize::new(0));
+        let key = encode_key(50, 2, 64, 64, &[9; 128]);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let cache = &cache;
+                let key = key.clone();
+                let produced = Arc::clone(&produced);
+                s.spawn(move || {
+                    let r = cache.get(key, || {
+                        produced.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![4; 16])
+                    });
+                    assert_eq!(r.as_ref().as_deref().unwrap(), &[4; 16][..]);
+                });
+            }
+        });
+        assert_eq!(produced.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_caches_errors_and_empty_outputs() {
+        let cache = TranscodeCache::new();
+        let produced = AtomicUsize::new(0);
+        let err_key = encode_key(50, 3, 2, 2, &[0; 12]);
+        let empty_key = encode_key(50, 3, 2, 2, &[1; 12]);
+
+        // errors are cached: the second lookup does not re-run the backend
+        let r1 = cache.get(err_key.clone(), || {
+            produced.fetch_add(1, Ordering::SeqCst);
+            Err(TranscodeError::Decode("boom".into()))
+        });
+        assert!(r1.is_err());
+        let r2 = cache.get(err_key, || {
+            produced.fetch_add(1, Ordering::SeqCst);
+            Err(TranscodeError::Decode("boom".into()))
+        });
+        assert!(r2.is_err());
+        assert_eq!(produced.load(Ordering::SeqCst), 1);
+
+        // empty buffers are cached too, so duplicates make the same decision
+        let e1 = cache.get(empty_key.clone(), || {
+            produced.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        });
+        assert!(e1.as_ref().as_deref().unwrap().is_empty());
+        let e2 = cache.get(empty_key, || {
+            produced.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        });
+        assert!(e2.as_ref().as_deref().unwrap().is_empty());
+        assert_eq!(produced.load(Ordering::SeqCst), 2);
     }
 }

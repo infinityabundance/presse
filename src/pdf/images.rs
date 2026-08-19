@@ -57,10 +57,13 @@ pub fn compress_images_with<T: ImageTranscoder>(
     verbose!(verbose, "[images] Found {} image object(s)", images.len());
 
     // Deduplication cache: identical images (logos, watermarks, headers)
-    // appear dozens of times in real PDFs; encode each unique image once.
+    // appear dozens of times in real PDFs; each unique image is encoded
+    // exactly once (competing workers converge on one result).
     let cache = TranscodeCache::new();
 
-    // Phase 2 — re-encode in parallel (pure, lock-free).
+    // Phase 2 — re-encode in parallel. Workers never touch `Document` state
+    // (document-lock-free); the dedup cache is the only shared structure and
+    // is internally synchronized.
     let reencoded: Vec<(ObjectId, Stream)> = images
         .into_par_iter()
         .map(|(id, stream)| {
@@ -170,7 +173,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
             // Identical JPEG bytes re-encode identically: encode once, reuse
             // the cached buffer for every duplicate image object.
             let input = Input::Jpeg(&stream.content);
-            let key = encode_key(quality, 2, &stream.content);
+            let key = encode_key(quality, 2, width, height, &stream.content);
             let result = cache.get(key, || transcoder.transcode_image(&input, quality));
             match result.as_ref() {
                 Ok(buf) if !buf.is_empty() => buf.clone(),
@@ -258,8 +261,10 @@ fn reencode_image_stream<T: ImageTranscoder>(
             };
 
             // Same pixels → same JPEG, regardless of how the source stream
-            // happened to be compressed.
-            let key = encode_key(quality, tag, key_bytes);
+            // happened to be compressed. Width/height are keyed too: two
+            // images with identical pixel bytes but different dimensions
+            // must not share a cached JPEG.
+            let key = encode_key(quality, tag, width, height, key_bytes);
             let result = cache.get(key, || transcoder.transcode_image(&input, quality));
             match result.as_ref() {
                 Ok(buf) if !buf.is_empty() => buf.clone(),

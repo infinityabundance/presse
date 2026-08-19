@@ -45,9 +45,6 @@ rayon = "1.12"
 # over miniz_oxide across the whole graph (see flate2 ffi/mod.rs priority).
 flate2 = { version = "1.1", features = ["zlib-rs"] }
 
-# Deduplicate identical image re-encodes
-ahash = "0.8"
-
 # Zero-copy input reads
 memmap2 = "0.9"
 
