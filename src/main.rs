@@ -17,7 +17,7 @@ use pdf::merger::merge;
 use pdf::reader::{
     get_compression_ratio_in_percent, get_pdf_size_in_kilobytes, load_input_as_pdf, load_pdf,
 };
-use pdf::writer::{compress_and_save_pdf, save_pdf};
+use pdf::writer::{compress_and_save_pdf, recompress_flate as recompress_flate_streams, save_pdf};
 use transcode::resolve;
 
 use clap::Parser;
@@ -41,6 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ssim,
             palette,
             jpeg_encoder,
+            recompress_flate,
+            raster_classify,
             verbose,
         } => {
             // Resolve the transcoding backend up front: requesting a backend
@@ -95,7 +97,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &transcoder,
                     dpi,
                     palette,
+                    raster_classify,
                 );
+
+                // `--recompress-flate` (qpdf-style): re-encode existing
+                // Flate streams at the writer's level before saving.
+                if recompress_flate {
+                    let n = recompress_flate_streams(&mut doc);
+                    verbose!(
+                        verbose,
+                        "[writer] recompressed {n} existing FlateDecode stream(s)"
+                    );
+                }
 
                 // Compressing the document
                 let output = resolve_press_path_output(file_path, &output);

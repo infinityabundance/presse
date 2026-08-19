@@ -44,6 +44,8 @@ use flate2::write::ZlibEncoder;
 use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use rayon::prelude::*;
 
+use crate::pdf::classify::{RasterClass, classify as classify_raster, classify_gray};
+use crate::pdf::fax::encode_g4;
 use crate::pdf::placements::{Placements, image_placements};
 use crate::transcode::{
     CpuTranscoder, ImageRef, ImageTranscoder, Input, TranscodeCache, encode_key,
@@ -152,6 +154,7 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
         &CpuTranscoder::default(),
         None,
         false,
+        false,
     );
 }
 
@@ -163,8 +166,11 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 /// `w·dpi/72 × h·dpi/72` pixels (Ghostscript's `/ebook`-style behavior),
 /// and images already below the cap keep their source resolution. `palette`
 /// additionally tries an `/Indexed` color-space candidate for eligible flat
-/// images and keeps the smallest of original / JPEG / indexed (default off:
-/// the JPEG-only pipeline). The pipeline is split in three phases:
+/// images and keeps the smallest of original / JPEG / indexed. `classify`
+/// (`--raster-classify`) runs the raster classifier first: bitonal content
+/// additionally gets a 1-bit CCITT G4 mask candidate (`/ImageMask`), and
+/// flat-color content gets the indexed candidate. Both are default off: the
+/// JPEG-only pipeline. The pipeline is split in three phases:
 /// 1. **Extract** — detach every eligible image stream from the `Document`
 ///    object tree (serial, cheap: just map lookups + moves, no copies).
 /// 2. **Re-encode** — transcode all streams concurrently with rayon on owned,
@@ -172,7 +178,8 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 ///    threads, so there is nothing to lock.
 /// 3. **Apply** — write the re-encoded streams (and updated `/Filter` +
 ///    `/Length`, plus `/Width` + `/Height` for downsampled images, and
-///    `/ColorSpace` + palette objects for indexed candidates) back into the
+///    `/ColorSpace` + palette objects for indexed candidates, and the
+///    `/ImageMask`/`/Decode` entries for mask candidates) back into the
 ///    object tree in a single serial pass, right before serialization. The
 ///    pass ends by coalescing byte-identical image objects.
 pub fn compress_images_with<T: ImageTranscoder>(
@@ -182,6 +189,7 @@ pub fn compress_images_with<T: ImageTranscoder>(
     transcoder: &T,
     dpi: Option<u32>,
     palette: bool,
+    classify: bool,
 ) {
     // Placement scan is needed only when downsampling is requested; without
     // it (the default) the pipeline is byte-identical to before.
@@ -220,7 +228,7 @@ pub fn compress_images_with<T: ImageTranscoder>(
         .into_par_iter()
         .map(|(id, stream)| {
             let outcome = reencode_image_stream(
-                id, stream, mode, verbose, &cache, transcoder, downsample, palette,
+                id, stream, mode, verbose, &cache, transcoder, downsample, palette, classify,
             );
             (id, outcome)
         })
@@ -262,6 +270,16 @@ pub fn compress_images_with<T: ImageTranscoder>(
                         Object::Reference(palette_id),
                     ]),
                 );
+                stream
+            }
+            // Mask candidates carry their full dictionary (phase 2 wrote
+            // /Filter + /DecodeParms + /ImageMask + /BitsPerComponent and
+            // removed /ColorSpace); phase 3 sets the /Decode table — mask
+            // samples paint at decoded 0, so [1 0] maps ink (1) to painted.
+            Reencoded::Mask { mut stream } => {
+                stream
+                    .dict
+                    .set(b"Decode", Object::Array(vec![1.into(), 0.into()]));
                 stream
             }
         };
@@ -309,6 +327,10 @@ enum Reencoded {
         hival: u8,
         colorspace: Vec<u8>,
     },
+    /// The stream carries a 1-bit CCITT G4 mask; phase 3 must set
+    /// `/ImageMask` + `/Decode` (the rest of the mask dictionary is already
+    /// written by phase 2).
+    Mask { stream: Stream },
 }
 
 /// The best replacement for one stream's content, already chosen by the
@@ -322,6 +344,11 @@ enum Candidate {
     /// Indexed-color payload, smaller than the source content.
     Indexed {
         candidate: IndexedCandidate,
+        dims: Option<(u32, u32)>,
+    },
+    /// 1-bit CCITT G4 mask, smaller than the source content.
+    Mask {
+        candidate: MaskCandidate,
         dims: Option<(u32, u32)>,
     },
     /// The source content wins; nothing replaced it.
@@ -351,6 +378,26 @@ impl IndexedCandidate {
     }
 }
 
+/// A 1-bit CCITT Group 4 mask candidate (`--raster-classify` on bitonal
+/// content). The mask XObject is an `/ImageMask` stencil — one bit per
+/// pixel, painted in the current color — so a text page stored as one RGB
+/// photograph becomes the representation a document compressor should use.
+struct MaskCandidate {
+    /// CCITT G4 fax data (1 = ink).
+    g4: Vec<u8>,
+    /// Raster dimensions the mask is written at.
+    width: u32,
+    height: u32,
+}
+
+impl MaskCandidate {
+    /// Full cost: the G4 payload plus the mask dictionary overhead (the
+    /// `/DecodeParms` + `/Decode` entries replace the `/ColorSpace`).
+    fn total_size(&self) -> usize {
+        self.g4.len() + PALETTE_OVERHEAD
+    }
+}
+
 /// Re-encode a single image stream. The stream is owned and detached from the
 /// document, so this can run on any rayon worker thread.
 ///
@@ -358,9 +405,9 @@ impl IndexedCandidate {
 /// when nothing could or should be re-encoded; a modified stream carrying the
 /// new JPEG payload (or an indexed candidate, described separately for the
 /// apply pass) otherwise.
-// The pipeline-wide context (mode/cache/transcoder/downsample/palette) is
-// deliberately passed as arguments rather than a bundle struct — callers are
-// generic over the transcoder and the function is internal.
+// The pipeline-wide context (mode/cache/transcoder/downsample/palette/
+// classify) is deliberately passed as arguments rather than a bundle struct
+// — callers are generic over the transcoder and the function is internal.
 #[allow(clippy::too_many_arguments)]
 fn reencode_image_stream<T: ImageTranscoder>(
     id: ObjectId,
@@ -371,6 +418,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
     transcoder: &T,
     downsample: Option<Downsample<'_>>,
     palette: bool,
+    classify: bool,
 ) -> Reencoded {
     // Resolve `-q` / `-ssim` to the JPEG quality for this stream. In ssim
     // mode the calibration is deterministic, so the dedup key (which
@@ -701,59 +749,97 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 }
             };
 
-            // `--palette`: an `/Indexed` candidate for plain 8-bit
-            // DeviceRGB rasters (see [`indexed_candidate`] for the why).
-            let indexed: Option<IndexedCandidate> =
-                if palette && palette_eligible(&stream, color_space_raw) {
-                    indexed_candidate(key_bytes, ew, eh)
+            // `--raster-classify`: the classifier runs first — it decides
+            // the routing: bitonal text gets a 1-bit CCITT G4 mask candidate,
+            // flat-color figures get the `/Indexed` candidate, and photos /
+            // mixed pages get neither (the within-image split is future
+            // work). `--palette` alone keeps offering the indexed candidate
+            // to every eligible raster; the candidate itself still
+            // self-gates on the fidelity/size courts.
+            let decision = if classify {
+                Some(if tag == 3 {
+                    classify_raster(key_bytes, ew, eh)
                 } else {
-                    None
-                };
+                    classify_gray(key_bytes, ew, eh)
+                })
+            } else {
+                None
+            };
 
-            // The size gate: pick the smallest of JPEG / indexed / source.
-            match (jpeg, indexed) {
-                (Some(jpeg), Some(idx)) => {
-                    let (jlen, ilen) = (jpeg.len(), idx.total_size());
-                    if ilen < jlen && ilen < original_len {
-                        Candidate::Indexed {
-                            candidate: idx,
-                            dims: resampled,
-                        }
-                    } else if jlen < original_len {
-                        Candidate::Jpeg {
-                            buf: jpeg,
-                            dims: resampled,
-                        }
-                    } else {
-                        verbose!(
-                            verbose,
-                            "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
-                            id,
-                            jlen,
-                            original_len
-                        );
-                        Candidate::Unchanged
-                    }
+            // A 1-bit CCITT G4 `/ImageMask` candidate for bitonal text.
+            let mask: Option<MaskCandidate> = decision
+                .as_ref()
+                .filter(|d| d.class == RasterClass::BitonalText)
+                .and_then(|d| d.mask.as_ref())
+                .map(|m| MaskCandidate {
+                    g4: encode_g4(m, ew, eh),
+                    width: ew,
+                    height: eh,
+                });
+
+            // `/Indexed` palette candidate for plain 8-bit DeviceRGB rasters
+            // (see [`indexed_candidate`]). Under `--raster-classify` it is
+            // offered only to flat-color figures — photos must stay on the
+            // JPEG path; `--palette` offers it to all eligible rasters.
+            let indexed: Option<IndexedCandidate> = if palette_eligible(&stream, color_space_raw)
+                && (palette
+                    || decision
+                        .as_ref()
+                        .is_some_and(|d| d.class == RasterClass::FlatColor))
+            {
+                indexed_candidate(key_bytes, ew, eh)
+            } else {
+                None
+            };
+
+            // The size gate: pick the smallest of JPEG / indexed / mask /
+            // source. Only a strictly smaller candidate replaces the source.
+            let mut best: Option<(usize, Candidate)> = None;
+            let mut consider = |size: usize, c: Candidate| {
+                if best.as_ref().is_none_or(|(s, _)| size < *s) {
+                    best = Some((size, c));
                 }
-                (Some(jpeg), None) if jpeg.len() < original_len => Candidate::Jpeg {
-                    buf: jpeg,
-                    dims: resampled,
-                },
-                (Some(jpeg), None) => {
+            };
+            if let Some(m) = mask {
+                consider(
+                    m.total_size(),
+                    Candidate::Mask {
+                        candidate: m,
+                        dims: resampled,
+                    },
+                );
+            }
+            if let Some(idx) = indexed {
+                consider(
+                    idx.total_size(),
+                    Candidate::Indexed {
+                        candidate: idx,
+                        dims: resampled,
+                    },
+                );
+            }
+            if let Some(j) = jpeg {
+                consider(
+                    j.len(),
+                    Candidate::Jpeg {
+                        buf: j,
+                        dims: resampled,
+                    },
+                );
+            }
+            match best {
+                Some((size, c)) if size < original_len => c,
+                Some((size, _)) => {
                     verbose!(
                         verbose,
                         "[img {:?}] → skipped: re-encoded ({}B) not smaller than original ({}B)",
                         id,
-                        jpeg.len(),
+                        size,
                         original_len
                     );
                     Candidate::Unchanged
                 }
-                (None, Some(idx)) if idx.total_size() < original_len => Candidate::Indexed {
-                    candidate: idx,
-                    dims: resampled,
-                },
-                (None, Some(_)) | (None, None) => Candidate::Unchanged,
+                None => Candidate::Unchanged,
             }
         }
         None => {
@@ -825,6 +911,43 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 hival: candidate.hival,
                 colorspace: candidate.colorspace,
             }
+        }
+        Candidate::Mask { candidate, dims } => {
+            verbose!(
+                verbose,
+                "[img {:?}] → compressed {}B → {}B 1-bit CCITT G4 mask",
+                id,
+                original_len,
+                candidate.g4.len()
+            );
+            stream.content = candidate.g4;
+            stream
+                .dict
+                .set(b"Filter", Object::Name(b"CCITTFaxDecode".to_vec()));
+            stream
+                .dict
+                .set(b"Length", Object::Integer(stream.content.len() as i64));
+            stream.dict.set(b"ImageMask", Object::Boolean(true));
+            stream.dict.set(b"BitsPerComponent", Object::Integer(1));
+            // A mask has no /ColorSpace (it is a stencil painted in the
+            // current color); /Decode is set by the apply pass: image-mask
+            // samples paint at decoded 0, so [1 0] maps ink (1, BlackIs1)
+            // to the painted state.
+            stream.dict.remove(b"ColorSpace");
+            stream.dict.set(
+                b"DecodeParms",
+                Object::Dictionary(dictionary! {
+                    "K" => -1,
+                    "BlackIs1" => true,
+                    "Columns" => candidate.width as i64,
+                    "Rows" => candidate.height as i64,
+                }),
+            );
+            if let Some((tw, th)) = dims {
+                stream.dict.set(b"Width", Object::Integer(tw as i64));
+                stream.dict.set(b"Height", Object::Integer(th as i64));
+            }
+            Reencoded::Mask { stream }
         }
     }
 }
@@ -947,8 +1070,9 @@ fn resize_raw(classified: &RawPixels<'_>, width: u32, height: u32, tw: u32, th: 
 }
 
 /// zlib-compress bytes (PDF `/FlateDecode`) at the writer's compression
-/// level. Infallible on a `Vec` sink.
-fn zlib_encode(data: &[u8]) -> Vec<u8> {
+/// level. Infallible on a `Vec` sink. Shared with the writer's
+/// `--recompress-flate` pass.
+pub(crate) fn zlib_encode(data: &[u8]) -> Vec<u8> {
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(9));
     enc.write_all(data)
         .expect("zlib write into a Vec cannot fail");

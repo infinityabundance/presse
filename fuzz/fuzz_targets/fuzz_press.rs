@@ -8,7 +8,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use presse::pdf::images::{QualityMode, compress_images, compress_images_with};
-use presse::pdf::writer::compress_and_save_pdf;
+use presse::pdf::writer::{compress_and_save_pdf, recompress_flate};
 
 const OUT: &str = "/tmp/presse-fuzz-out.pdf";
 
@@ -29,6 +29,7 @@ fuzz_target!(|data: &[u8]| {
         &presse::transcode::CpuTranscoder::default(),
         None,
         false,
+        false,
     );
     let _ = compress_and_save_pdf(&mut doc, OUT, false);
     let Ok(mut doc2) = lopdf::Document::load_mem(data) else {
@@ -47,10 +48,11 @@ fuzz_target!(|data: &[u8]| {
         &presse::transcode::CpuTranscoder::new(true),
         None,
         false,
+        false,
     );
     let _ = compress_and_save_pdf(&mut doc2b, OUT, false);
-    // Exercise the `--palette` candidate path as well (coalescing, the
-    // indexed-candidate builder and the median-cut quantizer all run).
+    // Exercise the `--palette` candidate path (the indexed-candidate builder
+    // and the median-cut quantizer run).
     let Ok(mut doc3) = lopdf::Document::load_mem(data) else {
         return;
     };
@@ -61,6 +63,23 @@ fuzz_target!(|data: &[u8]| {
         &presse::transcode::CpuTranscoder::default(),
         None,
         true,
+        false,
     );
     let _ = compress_and_save_pdf(&mut doc3, OUT, false);
+    // Exercise the `--raster-classify` path (classifier, mask candidate,
+    // CCITT G4 encoder, indexed routing) plus `--recompress-flate`.
+    let Ok(mut doc4) = lopdf::Document::load_mem(data) else {
+        return;
+    };
+    compress_images_with(
+        &mut doc4,
+        QualityMode::fixed(50),
+        false,
+        &presse::transcode::CpuTranscoder::new(true),
+        None,
+        true,
+        true,
+    );
+    let _ = recompress_flate(&mut doc4);
+    let _ = compress_and_save_pdf(&mut doc4, OUT, false);
 });

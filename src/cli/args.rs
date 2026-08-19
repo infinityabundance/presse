@@ -107,6 +107,49 @@ encoder, current behavior."
         )]
         jpeg_encoder: bool,
 
+        /// Recompress existing FlateDecode streams at the writer's level.
+        #[arg(
+            long,
+            default_value_t = false,
+            long_help = "qpdf-style structural recompression: decode every existing
+/FlateDecode stream and re-encode it at the writer's compression level (9),
+keeping it only when smaller.
+
+Form tools usually store streams at a lower level than the writer uses, so
+this recovers the difference (on the irs_fw2 scan corpus: qpdf's 1.81 ->
+1.34 MB). Pure-Flate streams only; DCT/LZW/multi-filter chains, streams
+with /DecodeParms and anything that fails to decompress are left alone.
+Lossless: decoding and re-encoding Flate changes no pixel or content
+bytes, only their storage size.
+
+Default (flag omitted): existing Flate streams are kept as-is, current
+behavior."
+        )]
+        recompress_flate: bool,
+
+        /// Classify rasters and store bitonal text as 1-bit CCITT G4 masks.
+        #[arg(
+            long,
+            default_value_t = false,
+            long_help = "Run the raster classifier on every decoded image: text/rules/line-art
+content stored as a photographic RGB raster is detected (adaptive Otsu
+threshold + connected-component density + color statistics) and re-stored
+as a lossless 1-bit CCITT Group 4 /ImageMask stencil, painted in the
+current color — the representation a document compressor should use for
+text, instead of paying photographic cost for it. Flat-color figures are
+routed to the /Indexed palette candidate. Photos and mixed pages are
+never masked.
+
+The mask drops color and anti-aliasing (bitonal content is black-on-white
+by definition, so this is the point of the flag), which is why it is
+opt-in rather than the default; on real scans the size win is large
+(an RGB page -> a few KB of G4). Only the smallest candidate (original /
+JPEG / indexed / mask) is kept per image.
+
+Default (flag omitted): JPEG-only pipeline, current behavior."
+        )]
+        raster_classify: bool,
+
         // Details during the compression process --> sizes comparison before & after
         #[arg(short, long, default_value_t = false)]
         verbose: bool,

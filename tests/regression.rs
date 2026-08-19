@@ -19,7 +19,7 @@ use image::GrayImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
 use presse::pdf::images::{QualityMode, compress_images, compress_images_with};
-use presse::pdf::writer::{compress_and_save_pdf, save_pdf};
+use presse::pdf::writer::{compress_and_save_pdf, recompress_flate, save_pdf};
 use presse::transcode::{
     Acceleration, CpuTranscoder, FallbackTranscoder, ImageTranscoder, Input, RuntimeTranscoder,
     TranscodeError, resolve,
@@ -1044,6 +1044,7 @@ fn dpi_downsampling_resizes_placed_images_and_updates_dims() {
         &CpuTranscoder::default(),
         Some(150),
         false,
+        false,
     );
     compress_and_save_pdf(
         &mut post.0,
@@ -1097,6 +1098,7 @@ fn dpi_above_effective_resolution_keeps_source_size() {
         false,
         &CpuTranscoder::default(),
         Some(600),
+        false,
         false,
     );
     compress_and_save_pdf(
@@ -1213,6 +1215,7 @@ fn gpu_failure_falls_back_to_cpu_identically() {
         false,
         &fallback,
         None,
+        false,
         false,
     );
 
@@ -1379,6 +1382,7 @@ fn cpu_transcoder_default_parity() {
         &CpuTranscoder::default(),
         None,
         false,
+        false,
     );
 
     let (p_path, e_path) = (
@@ -1425,6 +1429,7 @@ fn dpi_cap_never_upscales_and_matches_formula() {
             &CpuTranscoder::default(),
             Some(*dpi),
             false,
+            false,
         );
         compress_and_save_pdf(
             &mut doc.0,
@@ -1470,6 +1475,7 @@ fn xref_is_well_formed_and_all_objects_reachable() {
         false,
         &CpuTranscoder::default(),
         Some(150),
+        false,
         false,
     );
     compress_and_save_pdf(
@@ -1584,6 +1590,7 @@ fn grayscale_jpeg_stays_single_component() {
         &CpuTranscoder::default(),
         None,
         false,
+        false,
     );
     compress_and_save_pdf(&mut doc, dir.join("gray-post.pdf").to_str().unwrap(), false).unwrap();
 
@@ -1632,6 +1639,7 @@ fn concurrent_compression_is_deterministic_and_valid() {
                 &CpuTranscoder::default(),
                 None,
                 false,
+                false,
             );
             compress_and_save_pdf(&mut doc, path.to_str().unwrap(), false).unwrap();
             path
@@ -1666,6 +1674,7 @@ fn ssim_target_reduces_size_and_stays_valid() {
             &CpuTranscoder::default(),
             None,
             false,
+            false,
         );
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         std::fs::metadata(dir.join(name)).unwrap().len()
@@ -1698,6 +1707,7 @@ fn ssim_one_keeps_default_quality() {
             false,
             &CpuTranscoder::default(),
             None,
+            false,
             false,
         );
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
@@ -1737,6 +1747,7 @@ fn dpi_and_ssim_compose() {
             false,
             &CpuTranscoder::default(),
             dpi,
+            false,
             false,
         );
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
@@ -1837,6 +1848,7 @@ fn flat_figure_with_palette_flag_becomes_indexed() {
             &CpuTranscoder::default(),
             None,
             palette,
+            false,
         );
         compress_and_save_pdf(&mut doc, dir.join(name).to_str().unwrap(), false).unwrap();
     };
@@ -1897,6 +1909,7 @@ fn photo_with_palette_flag_stays_jpeg() {
         &CpuTranscoder::default(),
         None,
         true,
+        false,
     );
     compress_and_save_pdf(
         &mut doc,
@@ -1941,6 +1954,7 @@ fn jpeg_encoder_420_flag_smaller_valid_and_keeps_gray() {
             false,
             &transcoder,
             None,
+            false,
             false,
         );
         compress_and_save_pdf(&mut doc, dir.join(name).to_str().unwrap(), false).unwrap();
@@ -2030,4 +2044,277 @@ fn press_cli_jpeg_encoder_flag() {
         "--jpeg-encoder must shrink a photo PDF"
     );
     assert_visual_similarity(&dir, "je-cli", 0.90);
+}
+
+
+/// CCITT Group 4 encoder correctness, pinned through poppler: the same
+/// 1-bit mask stored as raw 1-bit `FlateDecode` and as `CCITTFaxDecode`
+/// (K = −1) must render *pixel-identically*. Both `/ImageMask` stencils
+/// carry the same bits; a single wrong bit pattern in the G4 stream shows
+/// up as a render difference.
+#[test]
+fn ccitt_g4_mask_decodes_identically_to_raw_1bit() {
+    let dir = test_dir();
+    if !pdftoppm_available() {
+        eprintln!("note: pdftoppm not found — skipping the G4 decode gate");
+        return;
+    }
+    let (w, h) = (600u32, 400u32);
+    let row_bytes = (w as usize).div_ceil(8);
+    let mut mask = vec![0u8; row_bytes * h as usize];
+    // Dense black-on-white "text": column bands of short strokes.
+    for y in 0..h {
+        for x in 0..w {
+            if (x / 40) % 3 == 0 && y % 7 < 4 {
+                mask[(y as usize) * row_bytes + (x as usize) / 8] |= 1 << (7 - (x % 8));
+            }
+        }
+    }
+    let g4 = presse::pdf::fax::encode_g4(&mask, w, h);
+    let flate = {
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut out = Vec::new();
+        let mut e = ZlibEncoder::new(&mut out, flate2::Compression::best());
+        e.write_all(&mask).unwrap();
+        e.finish().unwrap();
+        out
+    };
+
+    let build = |name: &str, filter: &str, parms: Option<lopdf::Dictionary>, data: Vec<u8>| {
+        let mut d = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "ImageMask" => true,
+            "BitsPerComponent" => 1,
+            "Filter" => filter,
+            "Decode" => vec![1.into(), 0.into()],
+            "Length" => data.len() as i64,
+        };
+        if let Some(p) = parms {
+            d.set("DecodeParms", p);
+        }
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => Vec::<Object>::new(), "Count" => 0,
+            }),
+        );
+        let img = doc.add_object(Object::Stream(Stream::new(d, data)));
+        let content = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            Content {
+                operations: vec![
+                    Operation::new("q", vec![]),
+                    Operation::new(
+                        "cm",
+                        vec![w.into(), 0.into(), 0.into(), h.into(), 0.into(), 0.into()],
+                    ),
+                    Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                    Operation::new("Q", vec![]),
+                ],
+            }
+            .encode()
+            .unwrap(),
+        )));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), w.into(), h.into()],
+            "Contents" => content,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img } },
+        });
+        if let Some(Object::Dictionary(pages)) = doc.objects.get_mut(&pages_id) {
+            pages.set("Kids", vec![Object::Reference(page)]);
+            pages.set("Count", 1);
+        }
+        let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", cat);
+        doc.save(dir.join(name)).unwrap();
+    };
+
+    build("g4-flate.pdf", "FlateDecode", None, flate);
+    build(
+        "g4-ccitt.pdf",
+        "CCITTFaxDecode",
+        Some(dictionary! {
+            "K" => -1,
+            "BlackIs1" => true,
+            "Columns" => w as i64,
+            "Rows" => h as i64,
+        }),
+        g4,
+    );
+
+    for name in ["g4-flate", "g4-ccitt"] {
+        assert!(
+            render_first_page(&dir.join(format!("{name}.pdf")), &dir.join(name)),
+            "pdftoppm failed on {name}"
+        );
+    }
+    let a = image::open(dir.join("g4-flate.png")).unwrap().to_luma8();
+    let b = image::open(dir.join("g4-ccitt.png")).unwrap().to_luma8();
+    assert_eq!(a.dimensions(), b.dimensions());
+    let diff = a
+        .pixels()
+        .zip(b.pixels())
+        .filter(|(x, y)| x[0] != y[0])
+        .count();
+    assert_eq!(
+        diff, 0,
+        "G4 mask must decode pixel-identically to raw 1-bit ({diff} px differ)"
+    );
+}
+
+/// `--raster-classify` end-to-end: a bitonal-text RGB page becomes a 1-bit
+/// CCITT G4 `/ImageMask` (far smaller, still renders as black-on-white),
+/// while a photographic image on the same run stays JPEG.
+#[test]
+fn raster_classify_masks_bitonal_text_and_keeps_photos_jpeg() {
+    let dir = test_dir();
+    // Bitonal text-like RGB raster: black strokes on white, no anti-aliasing.
+    let (w, h) = (320u32, 240u32);
+    let mut text = vec![255u8; (w * h * 3) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            if (x / 24) % 3 == 0 && y % 9 < 5 {
+                let p = ((y * w + x) * 3) as usize;
+                text[p] = 0;
+                text[p + 1] = 0;
+                text[p + 2] = 0;
+            }
+        }
+    }
+    let photo = photoish_rgb(200, 160);
+
+    let mut doc = new_doc();
+    add_image_page(&mut doc.0, doc.1, text.clone(), w, h, false);
+    add_image_page(&mut doc.0, doc.1, photo, 200, 160, false);
+    compress_images_with(
+        &mut doc.0,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder::default(),
+        None,
+        false,
+        true,
+    );
+    compress_and_save_pdf(
+        &mut doc.0,
+        dir.join("classify-post.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("classify-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 2, "both images must survive");
+    let mut masks = 0;
+    let mut jpegs = 0;
+    for (_, content, dict) in &images {
+        if dict.get(b"ImageMask").and_then(|m| m.as_bool()).ok() == Some(true) {
+            masks += 1;
+            assert_eq!(
+                dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
+                Some(b"CCITTFaxDecode".as_slice()),
+                "bitonal text must become a CCITT G4 mask"
+            );
+            assert_eq!(
+                dict.get(b"BitsPerComponent").and_then(|b| b.as_i64()).ok(),
+                Some(1)
+            );
+            assert!(
+                dict.get(b"ColorSpace").is_err(),
+                "masks have no /ColorSpace"
+            );
+            assert!(content.len() < 4 * 1024, "G4 mask must be tiny");
+        } else {
+            jpegs += 1;
+            assert!(is_dct_filter(dict), "photo must stay a DCT stream");
+        }
+    }
+    assert_eq!(masks, 1, "the bitonal page must be masked");
+    assert_eq!(jpegs, 1, "the photo must stay JPEG");
+
+    // The masked page renders as black-on-white text: close to the source.
+    let (mut pre, pages_id) = new_doc();
+    add_image_page(&mut pre, pages_id, text.clone(), w, h, false);
+    save_pdf(&mut pre, dir.join("classify-pre.pdf").to_str().unwrap()).unwrap();
+    assert_visual_similarity(&dir, "classify", 0.85);
+}
+
+/// `--recompress-flate` end-to-end: a document whose Flate streams sit at a
+/// low compression level shrinks (qpdf's structural trick) and stays valid.
+#[test]
+fn recompress_flate_flag_recompresses_existing_flate_streams() {
+    let dir = test_dir();
+
+    // A content stream compressed at level 1 (the "form tool" case).
+    let (mut doc, pages_id) = new_doc();
+    let content_bytes =
+        b"q 0 0 612 792 re W n BT /F1 12 Tf 72 720 Td (Recompress me.) Tj ET Q".repeat(200);
+    let level1 = {
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut out = Vec::new();
+        let mut e = ZlibEncoder::new(&mut out, flate2::Compression::new(1));
+        e.write_all(&content_bytes).unwrap();
+        e.finish().unwrap();
+        out
+    };
+    let content_stream = Stream::new(dictionary! { "Filter" => "FlateDecode" }, level1);
+    let content_id = doc.add_object(Object::Stream(content_stream));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! {},
+    });
+    push_kid(&mut doc, pages_id, page_id);
+
+    // Baseline save (no flag): stream kept as level-1.
+    let mut plain = Document::load_mem(&{
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    })
+    .unwrap();
+    compress_and_save_pdf(
+        &mut plain,
+        dir.join("refl-plain.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    // Flagged save: stream recompressed at level 9.
+    let mut flagged = Document::load_mem(&{
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    })
+    .unwrap();
+    let n = recompress_flate(&mut flagged);
+    assert_eq!(n, 1, "exactly the content stream must be recompressed");
+    compress_and_save_pdf(
+        &mut flagged,
+        dir.join("refl-flag.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let (a, b) = (
+        std::fs::metadata(dir.join("refl-plain.pdf")).unwrap().len(),
+        std::fs::metadata(dir.join("refl-flag.pdf")).unwrap().len(),
+    );
+    assert!(
+        b < a,
+        "--recompress-flate must shrink level-1 streams: {b} vs {a}"
+    );
+    let loaded = assert_well_formed(&dir.join("refl-flag.pdf"));
+    assert_eq!(loaded.get_pages().len(), 1);
 }
