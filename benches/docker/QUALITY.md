@@ -243,6 +243,43 @@ Pareto sweep re-run on the four fixtures above after this commit: the
 `q30` presse column in the table is the new state; wall times are
 unchanged (the coalescing pass is a cheap serial map walk).
 
+## The 4:2:0 experiment (`--jpeg-encoder`) and what the falsifier found
+
+Hypothesis under test: qpdf's lead on scan corpora is its JPEG chroma
+sampling — libjpeg's default RGB pipeline is YCbCr **4:2:0**, while presse's
+pinned `image` encoder writes effectively **4:4:4** (full-resolution Cb/Cr).
+
+`--jpeg-encoder` (default off) swaps the CPU encoder to the pure-Rust
+`jpeg-encoder` codec at 4:2:0 with box-averaged chroma (`h2v2_downsample`),
+AVX2 `simd` under native codegen. Verified on the actual stream:
+
+| encoder | sampling (SOF0) | img 0 payload (irs_fw2, q30) |
+|---|---|---|
+| `image` (default) | (1,1),(1,1),(1,1) — 4:4:4 | 40,977 B (16.9K flate-wrapped) |
+| `jpeg-encoder` 4:2:0 | (2,2),(1,1),(1,1) | 29,263 B (15.2K flate-wrapped) |
+| qpdf/libjpeg | (2,2),(1,1),(1,1) | 28,578 B (not flate-wrapped) |
+
+So the chroma hypothesis is **confirmed per-image**: 4:2:0 encodes half the
+chroma DCT blocks, and with the flate-wrap trick presse's img 0 (15.2K)
+now *beats* qpdf's (28.6K). On the photo corpus the flag also wins: −8.3%
+size (photos20/60 q50) and faster (304→162 ms, photos20).
+
+**But the falsifier did not reproduce the claimed 2.00 → ~1.5 MB on
+irs_fw2** — 4:2:0 lands at 1.994 MB, not 1.5. The reason is structural,
+not chroma: irs_fw2's image content is only ~265 KB; its 119 FlateDecode
+streams (1.81 MB) are stored at a low compression level, and qpdf
+**re-compresses existing Flate streams** (1.81 → 1.34 MB) while presse
+skips already-Flate streams. That 0.47 MB is the actual residual — a
+separate lever (a recompress-Flate pass in the writer), not the encoder.
+The claim "qpdf's win is 4:2:0" was wrong for this file; the claim "the
+`image` encoder's 4:4:4 doubles chroma resolution vs libjpeg" is correct
+and is what `--jpeg-encoder` fixes.
+
+**Witness update.** Because a luma-only court cannot see chroma loss,
+`native_image_ssim.py` now reports per-channel (min over R/G/B) SSIM next
+to luma, and `pareto.py` uses `min(luma, min-channel)` as the fidelity
+witness — a compressor that subsamples chroma is judged on what it changed.
+
 ## The `-d` × `-s` matrix (quality × speed, vs the tools)
 
 `-ssim <target>` replaces the arbitrary `-q` knob with a fidelity target:

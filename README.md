@@ -124,6 +124,7 @@ presse merge *.png *.pdf
 | `-d, --dpi` | source resolution | Cap placed image resolution to DPI pixels/inch (75 screen, 150 ebook, 300 printer, 600 prepress); omitted = keep source resolution |
 | `-s, --ssim` | `1.0` | Target output fidelity as measured SSIM (calibrated on grainy scans — the worst case for JPEG — so smoother content exceeds the target); lower = smaller and faster. `1.0` = use `-q` as given |
 | `--palette` | `false` | Also build an `/Indexed` palette candidate for eligible flat-color images (figures, charts, scans) and keep the smallest of original / JPEG / indexed; exact palettes are lossless, lossy ones are gated on 0.9999 native SSIM |
+| `--jpeg-encoder` | `false` | Use the pure-Rust `jpeg-encoder` codec (YCbCr 4:2:0, box-averaged chroma — libjpeg's default model, which Ghostscript/qpdf use) instead of the `image` crate's 4:4:4 encoder; smaller RGB output at the same `-q`, faster, but opt-in because luminance-SSIM courts don't see chroma loss |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -141,7 +142,27 @@ presse press big.pdf -o small.pdf -d 150   # ~ebook: 150 dpi cap
 presse press scans.pdf -d 75               # ~screen: 75 dpi cap
 presse press deck.pdf -s 0.86              # ~q9: fidelity-targeted, 60% smaller on photos
 presse press figures.pdf --palette         # also try indexed-color palettes
+presse press photos.pdf --jpeg-encoder     # libjpeg-style 4:2:0 chroma (smaller, faster)
 ```
+
+### Chroma subsampling (`--jpeg-encoder`)
+
+`--jpeg-encoder` swaps the CPU JPEG encoder from the `image` crate's
+full-resolution chroma (effectively 4:4:4) to the pure-Rust `jpeg-encoder`
+codec at **YCbCr 4:2:0 with box-averaged chroma downsampling** — exactly
+libjpeg/libjpeg-turbo's default RGB pipeline (`jpeg_set_defaults` +
+`h2v2_downsample`), which is the model Ghostscript and qpdf use. That is
+half the DCT chroma blocks of 4:4:4, so RGB output at the same `-q` is
+smaller (−8% on the photo corpus at q50) and the AVX2 `simd` path encodes
+faster. Grayscale images stay single-component on both paths. The flag is
+opt-in rather than the default because a luminance-SSIM quality court does
+not see chroma loss — the benchmark's native-image witness reports
+per-channel SSIM so 4:2:0 output is judged on what it actually changed.
+
+Why not the default: chroma subsampling is a quality tradeoff (invisible on
+most content, visible on sharp saturated edges), and the default output
+stays byte-identical to the pre-flag behavior. Only `press` takes the flag
+today.
 
 ### Duplicate-image collapsing and palette quantization
 

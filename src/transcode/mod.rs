@@ -110,11 +110,37 @@ pub trait ImageTranscoder: Send + Sync {
     fn transcode_image(&self, input: &Input, quality: u8) -> Result<Vec<u8>, TranscodeError>;
 }
 
-/// The default backend: CPU JPEG decode/encode with the `image` crate.
-/// Grayscale payloads are encoded as single-component JPEGs (see
-/// [`encode_jpeg`]), matching `/DeviceGray` streams.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CpuTranscoder;
+/// The default backend: CPU JPEG decode/encode. Two encoder paths are
+/// available:
+///
+/// - **`image` crate (default, [`CpuTranscoder::default`])** — 4:4:4 chroma
+///   (its `JpegEncoder` writes full-resolution Cb/Cr). Byte-identical to the
+///   pre-`--jpeg-encoder` behavior.
+/// - **`jpeg-encoder` crate (`--jpeg-encoder`)** — YCbCr **4:2:0 with
+///   box-averaged chroma downsampling**, matching libjpeg/libjpeg-turbo's
+///   default RGB pipeline (`jpeg_set_defaults` → 2×2 luminance, 1×1 chroma;
+///   `h2v2_downsample`). That is the model Ghostscript and qpdf actually
+///   use, and it encodes half the DCT chroma blocks of 4:4:4 — the dominant
+///   size difference behind qpdf's lead on scan corpora (irs_fw2: 2.00 →
+///   ~1.5 MB at q30). The `simd` feature gives it runtime-detected AVX2
+///   DCT/quantization under `-C target-cpu=native`.
+///
+/// Grayscale payloads stay single-component JPEGs on both paths (see
+/// [`encode_jpeg`] / [`encode_jpeg_420`]), matching `/DeviceGray` streams.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuTranscoder {
+    /// Use the `jpeg-encoder` codec (4:2:0 box-averaged) instead of the
+    /// `image` crate's 4:4:4 encoder. Default `false` keeps the output
+    /// byte-identical to the pre-flag behavior.
+    native_jpeg: bool,
+}
+
+impl CpuTranscoder {
+    /// `native_jpeg: true` selects the `--jpeg-encoder` 4:2:0 codec.
+    pub fn new(native_jpeg: bool) -> Self {
+        Self { native_jpeg }
+    }
+}
 
 impl ImageTranscoder for CpuTranscoder {
     fn transcode_image(&self, input: &Input, quality: u8) -> Result<Vec<u8>, TranscodeError> {
@@ -137,6 +163,16 @@ impl ImageTranscoder for CpuTranscoder {
                 .ok_or_else(|| TranscodeError::Decode("bad RGB dimensions".into()))?,
         };
         let mut out = Vec::new();
+        if self.native_jpeg {
+            // The jpeg-encoder API is u16-addressed; a raster wider or taller
+            // than 65535 px falls back to the image encoder rather than
+            // wrapping (impossible in practice — a 65k×65k image is 12 GB —
+            // but a pathological PDF must not panic or emit a corrupt JPEG).
+            if img.width() <= u16::MAX as u32 && img.height() <= u16::MAX as u32 {
+                encode_jpeg_420(&mut out, &img, quality)?;
+                return Ok(out);
+            }
+        }
         encode_jpeg(&mut out, &img, quality);
         Ok(out)
     }
@@ -157,11 +193,21 @@ pub struct FallbackTranscoder<G> {
 }
 
 impl<G: ImageTranscoder> FallbackTranscoder<G> {
-    /// `gpu: None` disables the GPU path entirely (e.g. init failed).
+    /// `gpu: None` disables the GPU path entirely (e.g. init failed). The
+    /// CPU fallback is the default 4:4:4 encoder; use [`Self::with_cpu`] to
+    /// select the `--jpeg-encoder` 4:2:0 path.
     #[allow(dead_code)] // called only by the feature-gated `resolve` paths
     pub fn new(gpu: Option<G>, min_bytes: usize) -> Self {
+        Self::with_cpu(gpu, min_bytes, CpuTranscoder::default())
+    }
+
+    /// Like [`Self::new`], with an explicit CPU fallback transcoder (so a
+    /// `--jpeg-encoder` run keeps the 4:2:0 encoder even when the GPU path
+    /// falls back to CPU).
+    #[allow(dead_code)] // called only by the feature-gated `resolve` paths
+    pub fn with_cpu(gpu: Option<G>, min_bytes: usize, cpu: CpuTranscoder) -> Self {
         Self {
-            cpu: CpuTranscoder,
+            cpu,
             gpu,
             min_bytes,
             warned: AtomicBool::new(false),
@@ -233,41 +279,49 @@ impl ImageTranscoder for RuntimeTranscoder {
 
 /// Resolve an `--acceleration` selector to a concrete backend.
 ///
+/// `native_jpeg` selects the `--jpeg-encoder` 4:2:0 CPU codec for the CPU
+/// path (and for the GPU-fallback path, so a GPU failure mid-run does not
+/// silently switch chroma sampling).
+///
 /// Requesting a backend that was not compiled in (`cuda`/`rocm` without the
 /// matching Cargo feature) is an explicit error naming the missing flag.
 /// Requesting a compiled-in backend whose library/driver is missing at
 /// runtime warns and degrades to the CPU backend.
-pub fn resolve(acceleration: Acceleration) -> Result<RuntimeTranscoder, String> {
+pub fn resolve(acceleration: Acceleration, native_jpeg: bool) -> Result<RuntimeTranscoder, String> {
+    let cpu = CpuTranscoder::new(native_jpeg);
     match acceleration {
-        Acceleration::Cpu => Ok(RuntimeTranscoder::Cpu(CpuTranscoder)),
+        Acceleration::Cpu => Ok(RuntimeTranscoder::Cpu(cpu)),
         Acceleration::Auto => {
             #[cfg(feature = "cuda")]
             if let Ok(gpu) = cuda::CudaTranscoder::new() {
-                return Ok(RuntimeTranscoder::Cuda(FallbackTranscoder::new(
+                return Ok(RuntimeTranscoder::Cuda(FallbackTranscoder::with_cpu(
                     Some(gpu),
                     GPU_MIN_STREAM_BYTES,
+                    cpu,
                 )));
             }
             #[cfg(feature = "rocm")]
             if let Ok(gpu) = rocm::RocmTranscoder::new() {
-                return Ok(RuntimeTranscoder::Rocm(FallbackTranscoder::new(
+                return Ok(RuntimeTranscoder::Rocm(FallbackTranscoder::with_cpu(
                     Some(gpu),
                     GPU_MIN_STREAM_BYTES,
+                    cpu,
                 )));
             }
-            Ok(RuntimeTranscoder::Cpu(CpuTranscoder))
+            Ok(RuntimeTranscoder::Cpu(cpu))
         }
         Acceleration::Cuda => {
             #[cfg(feature = "cuda")]
             {
                 match cuda::CudaTranscoder::new() {
-                    Ok(gpu) => Ok(RuntimeTranscoder::Cuda(FallbackTranscoder::new(
+                    Ok(gpu) => Ok(RuntimeTranscoder::Cuda(FallbackTranscoder::with_cpu(
                         Some(gpu),
                         GPU_MIN_STREAM_BYTES,
+                        cpu,
                     ))),
                     Err(e) => {
                         eprintln!("warning: {e}; falling back to the CPU backend");
-                        Ok(RuntimeTranscoder::Cpu(CpuTranscoder))
+                        Ok(RuntimeTranscoder::Cpu(cpu))
                     }
                 }
             }
@@ -282,13 +336,14 @@ pub fn resolve(acceleration: Acceleration) -> Result<RuntimeTranscoder, String> 
             #[cfg(feature = "rocm")]
             {
                 match rocm::RocmTranscoder::new() {
-                    Ok(gpu) => Ok(RuntimeTranscoder::Rocm(FallbackTranscoder::new(
+                    Ok(gpu) => Ok(RuntimeTranscoder::Rocm(FallbackTranscoder::with_cpu(
                         Some(gpu),
                         GPU_MIN_STREAM_BYTES,
+                        cpu,
                     ))),
                     Err(e) => {
                         eprintln!("warning: {e}; falling back to the CPU backend");
-                        Ok(RuntimeTranscoder::Cpu(CpuTranscoder))
+                        Ok(RuntimeTranscoder::Cpu(cpu))
                     }
                 }
             }
@@ -353,6 +408,38 @@ pub(crate) fn encode_jpeg(out: &mut Vec<u8>, img: &image::DynamicImage, quality:
         }
         other => {
             let _ = encoder.encode_image(other);
+        }
+    }
+}
+
+/// Encode `img` as JPEG with libjpeg-compatible **4:2:0** chroma
+/// subsampling (box-averaged, `h2v2_downsample`) — the `--jpeg-encoder`
+/// path. Grayscale stays a single-component JPEG, matching `/DeviceGray`
+/// streams; RGB goes through YCbCr 4:2:0 exactly like libjpeg's default
+/// `jpeg_set_defaults` pipeline that qpdf and Ghostscript use.
+///
+/// The AVX2 `simd` feature is compiled in and dispatch is runtime-detected,
+/// so under `-C target-cpu=native` the DCT/quantization loops use the same
+/// instruction set as the rest of the pipeline.
+pub(crate) fn encode_jpeg_420(
+    out: &mut Vec<u8>,
+    img: &image::DynamicImage,
+    quality: u8,
+) -> Result<(), TranscodeError> {
+    use jpeg_encoder::{ChromaSubsamplingMethod, ColorType, Encoder, SamplingFactor};
+    let (w, h) = (img.width() as u16, img.height() as u16);
+    let mut encoder = Encoder::new(out, quality);
+    encoder.set_sampling_factor(SamplingFactor::R_4_2_0);
+    encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Average);
+    match img {
+        image::DynamicImage::ImageLuma8(gray) => encoder
+            .encode(gray.as_raw(), w, h, ColorType::Luma)
+            .map_err(|e| TranscodeError::Encode(format!("jpeg-encoder (luma): {e}"))),
+        other => {
+            let rgb = other.to_rgb8();
+            encoder
+                .encode(&rgb, w, h, ColorType::Rgb)
+                .map_err(|e| TranscodeError::Encode(format!("jpeg-encoder (rgb): {e}")))
         }
     }
 }
@@ -451,10 +538,60 @@ impl TranscodeCache {
 
 #[cfg(test)]
 mod tests {
+    use super::encode_jpeg;
+    use super::encode_jpeg_420;
     use super::jpeg_components;
     use super::{TranscodeCache, TranscodeError, encode_key};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Photo-ish RGB pixels (smooth gradient + grain).
+    fn photoish_rgb(w: u32, h: u32) -> Vec<u8> {
+        let mut next: u64 = 42;
+        let mut v = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                next ^= next << 13;
+                next ^= next >> 7;
+                next ^= next << 17;
+                let n = (next & 0x1f) as u8;
+                let (r, g, b) = (
+                    (x as f32 / w as f32 * 255.0) as u8,
+                    (y as f32 / h as f32 * 255.0) as u8,
+                    (128.0 + 80.0 * ((x as f32 + y as f32) / 32.0).sin()) as u8,
+                );
+                v.extend_from_slice(&[r.wrapping_add(n), g.wrapping_add(n), b.wrapping_add(n)]);
+            }
+        }
+        v
+    }
+
+    /// Parse the SOF0 frame header of a JPEG and return each component's
+    /// (horizontal, vertical) sampling factors.
+    fn sampling_factors(jpeg: &[u8]) -> Vec<(u8, u8)> {
+        let mut i = 2;
+        while i + 4 <= jpeg.len() {
+            if jpeg[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = jpeg[i + 1];
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+            {
+                let components = jpeg[i + 9];
+                let mut out = Vec::with_capacity(components as usize);
+                let mut j = i + 10;
+                for _ in 0..components {
+                    let s = jpeg[j + 1];
+                    out.push((s >> 4, s & 0x0F));
+                    j += 3;
+                }
+                return out;
+            }
+            i += 2 + u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        }
+        Vec::new()
+    }
 
     /// Build a minimal JPEG with the given component count by emitting a
     /// scan-less frame header (SOF0) after SOI.
@@ -598,5 +735,77 @@ mod tests {
         });
         assert!(e2.as_ref().as_deref().unwrap().is_empty());
         assert_eq!(produced.load(Ordering::SeqCst), 2);
+    }
+
+    /// The 4:2:0 codec must write YCbCr 2×2/1×1/1×1 sampling factors —
+    /// libjpeg's default — while the `image` encoder writes 4:4:4 (1×1/1×1/1×1).
+    #[test]
+    fn jpeg_encoder_420_writes_libjpeg_sampling_factors() {
+        let img = image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(128, 96, photoish_rgb(128, 96)).unwrap(),
+        );
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        encode_jpeg(&mut a, &img, 50);
+        encode_jpeg_420(&mut b, &img, 50).unwrap();
+        assert_eq!(
+            sampling_factors(&a),
+            vec![(1, 1), (1, 1), (1, 1)],
+            "image crate = 4:4:4"
+        );
+        assert_eq!(
+            sampling_factors(&b),
+            vec![(2, 2), (1, 1), (1, 1)],
+            "jpeg-encoder = 4:2:0"
+        );
+    }
+
+    /// Same quality, same pixels: 4:2:0 encodes half the chroma DCT blocks of
+    /// 4:4:4 and must be materially smaller on RGB content.
+    #[test]
+    fn jpeg_encoder_420_is_smaller_than_444_on_rgb() {
+        let img = image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(256, 192, photoish_rgb(256, 192)).unwrap(),
+        );
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        encode_jpeg(&mut a, &img, 50);
+        encode_jpeg_420(&mut b, &img, 50).unwrap();
+        assert!(
+            b.len() < a.len(),
+            "4:2:0 must beat 4:4:4 at the same quality: {} vs {}",
+            b.len(),
+            a.len()
+        );
+        // Both decode back to the same raster size (a wrapped/shrunk chroma
+        // plane must not change geometry).
+        let (da, db) = (
+            image::load_from_memory(&a).unwrap(),
+            image::load_from_memory(&b).unwrap(),
+        );
+        assert_eq!((da.width(), da.height()), (db.width(), db.height()));
+    }
+
+    /// Grayscale stays a single-component JPEG on the 4:2:0 path — a
+    /// 3-component JPEG inside a /DeviceGray stream renders as garbage.
+    #[test]
+    fn jpeg_encoder_420_keeps_grayscale_single_component() {
+        let mut gray = Vec::with_capacity(128 * 128);
+        for y in 0..128u32 {
+            for x in 0..128u32 {
+                gray.push(((x as f32 / 128.0 + y as f32 / 128.0) * 127.5) as u8);
+            }
+        }
+        let img =
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(128, 128, gray).unwrap());
+        let mut out = Vec::new();
+        encode_jpeg_420(&mut out, &img, 50).unwrap();
+        assert_eq!(
+            sampling_factors(&out),
+            vec![(1, 1)],
+            "luma stays 1-component"
+        );
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert_eq!(decoded.color(), image::ColorType::L8);
     }
 }

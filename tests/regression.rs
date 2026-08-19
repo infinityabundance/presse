@@ -1041,7 +1041,7 @@ fn dpi_downsampling_resizes_placed_images_and_updates_dims() {
         &mut post.0,
         QualityMode::fixed(QUALITY),
         false,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         Some(150),
         false,
     );
@@ -1095,7 +1095,7 @@ fn dpi_above_effective_resolution_keeps_source_size() {
         &mut doc.0,
         QualityMode::fixed(QUALITY),
         false,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         Some(600),
         false,
     );
@@ -1270,7 +1270,7 @@ fn gpu_routing_respects_stream_size_threshold() {
 fn unbuilt_acceleration_is_an_explicit_error() {
     #[cfg(not(feature = "cuda"))]
     {
-        let err = resolve(Acceleration::Cuda).unwrap_err();
+        let err = resolve(Acceleration::Cuda, false).unwrap_err();
         assert!(
             err.contains("--features cuda"),
             "error must name the missing flag: {err}"
@@ -1278,7 +1278,7 @@ fn unbuilt_acceleration_is_an_explicit_error() {
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let err = resolve(Acceleration::Rocm).unwrap_err();
+        let err = resolve(Acceleration::Rocm, false).unwrap_err();
         assert!(
             err.contains("--features rocm"),
             "error must name the missing flag: {err}"
@@ -1286,12 +1286,12 @@ fn unbuilt_acceleration_is_an_explicit_error() {
     }
     // cpu always resolves; auto resolves to cpu without a driver.
     assert!(matches!(
-        resolve(Acceleration::Cpu),
+        resolve(Acceleration::Cpu, false),
         Ok(RuntimeTranscoder::Cpu(_))
     ));
     #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     assert!(matches!(
-        resolve(Acceleration::Auto),
+        resolve(Acceleration::Auto, false),
         Ok(RuntimeTranscoder::Cpu(_))
     ));
 }
@@ -1376,7 +1376,7 @@ fn cpu_transcoder_default_parity() {
         &mut explicit,
         QualityMode::fixed(QUALITY),
         false,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         None,
         false,
     );
@@ -1422,7 +1422,7 @@ fn dpi_cap_never_upscales_and_matches_formula() {
             &mut doc.0,
             QualityMode::fixed(QUALITY),
             false,
-            &CpuTranscoder,
+            &CpuTranscoder::default(),
             Some(*dpi),
             false,
         );
@@ -1468,7 +1468,7 @@ fn xref_is_well_formed_and_all_objects_reachable() {
         &mut doc,
         QualityMode::fixed(QUALITY),
         false,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         Some(150),
         false,
     );
@@ -1581,7 +1581,7 @@ fn grayscale_jpeg_stays_single_component() {
         &mut doc,
         QualityMode::fixed(QUALITY),
         false,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         None,
         false,
     );
@@ -1629,7 +1629,7 @@ fn concurrent_compression_is_deterministic_and_valid() {
                 &mut doc,
                 QualityMode::fixed(QUALITY),
                 false,
-                &CpuTranscoder,
+                &CpuTranscoder::default(),
                 None,
                 false,
             );
@@ -1659,7 +1659,14 @@ fn ssim_target_reduces_size_and_stays_valid() {
         for _ in 0..4 {
             add_image_page(&mut doc.0, doc.1, gradient_gray(256, 256), 256, 256, true);
         }
-        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None, false);
+        compress_images_with(
+            &mut doc.0,
+            mode,
+            false,
+            &CpuTranscoder::default(),
+            None,
+            false,
+        );
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         std::fs::metadata(dir.join(name)).unwrap().len()
     };
@@ -1685,7 +1692,14 @@ fn ssim_one_keeps_default_quality() {
     let run = |mode: QualityMode, name: &str| {
         let mut doc = new_doc();
         add_image_page(&mut doc.0, doc.1, photoish_rgb(200, 200), 200, 200, false);
-        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None, false);
+        compress_images_with(
+            &mut doc.0,
+            mode,
+            false,
+            &CpuTranscoder::default(),
+            None,
+            false,
+        );
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         std::fs::read(dir.join(name)).unwrap()
     };
@@ -1717,7 +1731,14 @@ fn dpi_and_ssim_compose() {
             false,
             (200.0, 200.0),
         );
-        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, dpi, false);
+        compress_images_with(
+            &mut doc.0,
+            mode,
+            false,
+            &CpuTranscoder::default(),
+            dpi,
+            false,
+        );
         compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
         let loaded = Document::load(dir.join(name)).unwrap();
         let (_, _, dict) = &find_image_streams(&loaded)[0];
@@ -1813,7 +1834,7 @@ fn flat_figure_with_palette_flag_becomes_indexed() {
             &mut doc,
             QualityMode::fixed(QUALITY),
             false,
-            &CpuTranscoder,
+            &CpuTranscoder::default(),
             None,
             palette,
         );
@@ -1873,7 +1894,7 @@ fn photo_with_palette_flag_stays_jpeg() {
         &mut doc,
         QualityMode::fixed(QUALITY),
         false,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         None,
         true,
     );
@@ -1898,4 +1919,115 @@ fn photo_with_palette_flag_stays_jpeg() {
         "ColorSpace must stay a plain DeviceRGB name"
     );
     assert_visual_similarity(&dir, "photo-pal", 0.95);
+}
+
+/// `--jpeg-encoder` (the 4:2:0 box-averaged codec) must produce smaller RGB
+/// output than the default 4:4:4 encoder at the same quality, stay
+/// structurally valid, keep grayscale single-component, and still render
+/// equivalently. Default (flag off) stays byte-identical to the image-crate
+/// path — already covered by `cpu_transcoder_default_parity`.
+#[test]
+fn jpeg_encoder_420_flag_smaller_valid_and_keeps_gray() {
+    let dir = test_dir();
+
+    let build = |native: bool, name: &str| {
+        let (mut doc, pages_id) = new_doc();
+        add_image_page(&mut doc, pages_id, photoish_rgb(256, 192), 256, 192, false);
+        add_image_page(&mut doc, pages_id, gradient_gray(256, 192), 256, 192, true);
+        let transcoder = CpuTranscoder::new(native);
+        compress_images_with(
+            &mut doc,
+            QualityMode::fixed(QUALITY),
+            false,
+            &transcoder,
+            None,
+            false,
+        );
+        compress_and_save_pdf(&mut doc, dir.join(name).to_str().unwrap(), false).unwrap();
+    };
+    build(false, "je-444.pdf");
+    build(true, "je-post.pdf");
+
+    let (a, b) = (
+        std::fs::metadata(dir.join("je-444.pdf")).unwrap().len(),
+        std::fs::metadata(dir.join("je-post.pdf")).unwrap().len(),
+    );
+    assert!(
+        b < a,
+        "4:2:0 must beat 4:4:4 on RGB at the same quality: {b} vs {a}"
+    );
+
+    let loaded = assert_well_formed(&dir.join("je-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 2);
+    let mut gray_seen = 0;
+    for (_, content, dict) in &images {
+        assert!(is_dct_filter(dict), "re-encoded images must be DCT streams");
+        // The grayscale stream keeps a single-component JPEG payload.
+        if dict.get(b"ColorSpace").and_then(|c| c.as_name()).ok() == Some(b"DeviceGray".as_slice())
+        {
+            gray_seen += 1;
+            let jpeg = match dict.get(b"Filter") {
+                Ok(Object::Array(_)) => unwrap_flate(content),
+                _ => content.clone(),
+            };
+            let img = image::load_from_memory(&jpeg).expect("gray JPEG must decode");
+            assert_eq!(
+                img.color(),
+                image::ColorType::L8,
+                "gray must stay single-component under --jpeg-encoder"
+            );
+        }
+    }
+    assert_eq!(gray_seen, 1, "the gray image must be present");
+
+    // Pre-render for the visual gate.
+    let mut pre = new_doc();
+    add_image_page(&mut pre.0, pre.1, photoish_rgb(256, 192), 256, 192, false);
+    add_image_page(&mut pre.0, pre.1, gradient_gray(256, 192), 256, 192, true);
+    save_pdf(&mut pre.0, dir.join("je-pre.pdf").to_str().unwrap()).unwrap();
+    assert_visual_similarity(&dir, "je", 0.90);
+}
+
+/// CLI end-to-end: `presse press --jpeg-encoder` on a photo PDF is valid,
+/// smaller than the same run without the flag, and renders equivalently.
+#[test]
+fn press_cli_jpeg_encoder_flag() {
+    let dir = test_dir();
+    let (mut doc, pages_id) = new_doc();
+    for _ in 0..4 {
+        add_image_page(&mut doc, pages_id, photoish_rgb(200, 200), 200, 200, false);
+    }
+    save_pdf(&mut doc, dir.join("je-cli-pre.pdf").to_str().unwrap()).unwrap();
+
+    let presse = env!("CARGO_BIN_EXE_presse");
+    let (plain, flag) = (dir.join("je-cli-plain.pdf"), dir.join("je-cli-post.pdf"));
+    let input = dir.join("je-cli-pre.pdf");
+    for (out, extra) in [(plain.clone(), false), (flag.clone(), true)] {
+        let mut args = vec![
+            "press",
+            input.to_str().unwrap(),
+            "-q",
+            "50",
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        if extra {
+            args.push("--jpeg-encoder");
+        }
+        let status = Command::new(presse)
+            .args(&args)
+            .status()
+            .expect("presse should run");
+        assert!(
+            status.success(),
+            "press --jpeg-encoder must exit successfully"
+        );
+        assert_well_formed(&out);
+    }
+    assert!(
+        std::fs::metadata(&flag).unwrap().len() < std::fs::metadata(&plain).unwrap().len(),
+        "--jpeg-encoder must shrink a photo PDF"
+    );
+    assert_visual_similarity(&dir, "je-cli", 0.90);
 }

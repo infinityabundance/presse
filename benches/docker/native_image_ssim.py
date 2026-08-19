@@ -39,6 +39,38 @@ def ssim(a: np.ndarray, b: np.ndarray, window: int = 512) -> float:
     return ((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
 
 
+def ssim_with_chroma(a: np.ndarray, b: np.ndarray, window: int = 512) -> tuple[float, float]:
+    """Luma + chroma SSIM on the same window. Chroma degradation (e.g. a
+    4:4:4 -> 4:2:0 subsample, which qpdf/libjpeg does by default and which
+    the --jpeg-encoder path reproduces) is invisible to a luma-only witness:
+    Y is untouched while Cb/Cr lose 75% of their samples. The min over the
+    R/G/B channels is the stricter color witness, so a compressor that
+    throws away chroma is judged on what it actually changed.
+
+    Returns (luma, min_channel) SSIM.
+    """
+    long_edge = max(a.shape[0], a.shape[1])
+    w = min(window, long_edge)
+    a = np.asarray(Image.fromarray(a).convert("RGB").resize((w, w), Image.BILINEAR), dtype=np.float64)
+    b = np.asarray(Image.fromarray(b).convert("RGB").resize((w, w), Image.BILINEAR), dtype=np.float64)
+    n = a.shape[0] * a.shape[1]
+
+    def _ssim(x: np.ndarray, y: np.ndarray) -> float:
+        mx, my = x.mean(), y.mean()
+        vx = ((x - mx) ** 2).sum() / n
+        vy = ((y - my) ** 2).sum() / n
+        cov = ((x - mx) * (y - my)).sum() / n
+        c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+        return ((2 * mx * my + c1) * (2 * cov + c2)) / ((mx * mx + my * my + c1) * (vx + vy + c2))
+
+    luma = _ssim(
+        0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2],
+        0.299 * b[..., 0] + 0.587 * b[..., 1] + 0.114 * b[..., 2],
+    )
+    chroma = min(_ssim(a[..., i], b[..., i]) for i in range(3))
+    return luma, chroma
+
+
 def extract(pdf: Path, work: Path, tag: str) -> list[Path]:
     subprocess.run(["pdfimages", "-j", str(pdf), str(work / tag)], capture_output=True)
     return sorted((work / f"{tag}-{i:03d}.jpg" for i in range(1000)) if False else
@@ -60,6 +92,7 @@ def main():
         pairs = list(zip(src, out))
         print(f"{len(pairs)} images; SSIM at shipped resolution (source resampled to output size)")
         worst = (1.0, None)
+        worst_chroma = (1.0, None)
         for i, (s, o) in enumerate(pairs):
             try:
                 a = np.asarray(Image.open(s).convert("RGB"))
@@ -70,13 +103,16 @@ def main():
             # source → output resolution (the level the compressor shipped)
             if a.shape != b.shape:
                 a = np.asarray(Image.fromarray(a).resize((b.shape[1], b.shape[0]), Image.LANCZOS))
-            score = ssim(a, b)
-            if score < worst[0]:
-                worst = (score, i)
+            luma, chroma = ssim_with_chroma(a, b)
+            if luma < worst[0]:
+                worst = (luma, i)
+            if chroma < worst_chroma[0]:
+                worst_chroma = (chroma, i)
             print(f"  img {i:2d}: src {s.stat().st_size/1e3:7.1f} KB -> out {o.stat().st_size/1e3:7.1f} KB"
                   f"  {a.shape[1]}x{a.shape[0]} -> {b.shape[1]}x{b.shape[0]}"
-                  f"  SSIM {score:.4f}")
-        print(f"worst image SSIM: {worst[0]:.4f} (img {worst[1]})")
+                  f"  luma SSIM {luma:.4f}  chroma SSIM {chroma:.4f}")
+        print(f"worst luma SSIM:   {worst[0]:.4f} (img {worst[1]})")
+        print(f"worst chroma SSIM: {worst_chroma[0]:.4f} (img {worst_chroma[1]})")
 
 
 if __name__ == "__main__":

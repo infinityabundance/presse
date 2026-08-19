@@ -83,6 +83,30 @@ Default (flag omitted): JPEG-only pipeline, current behavior."
         )]
         palette: bool,
 
+        /// Use the native Rust `jpeg-encoder` codec (YCbCr 4:2:0, box-
+        /// averaged chroma) instead of the `image` crate's 4:4:4 encoder.
+        #[arg(
+            long,
+            default_value_t = false,
+            long_help = "Use the pure-Rust `jpeg-encoder` codec on the CPU path instead of the
+`image` crate's encoder.
+
+The `image` encoder writes full-resolution Cb/Cr (effectively 4:4:4); the
+`jpeg-encoder` codec writes YCbCr 4:2:0 with box-averaged chroma
+downsampling — exactly libjpeg/libjpeg-turbo's default RGB pipeline
+(jpeg_set_defaults + h2v2_downsample), which is the model Ghostscript and
+qpdf use. That is half the DCT chroma blocks of 4:4:4, so RGB output at
+the same -q is materially smaller (on the irs_fw2 scan corpus: 2.00 ->
+~1.5 MB at q30, matching qpdf). Chroma loss is invisible to a luminance
+SSIM witness, so this is opt-in rather than the default; the benchmark's
+native-image witness reports per-channel SSIM to keep it honest.
+
+Grayscale images stay single-component on both paths. The flag applies to
+the CPU path and to GPU fallback. Default (flag omitted): the `image`
+encoder, current behavior."
+        )]
+        jpeg_encoder: bool,
+
         // Details during the compression process --> sizes comparison before & after
         #[arg(short, long, default_value_t = false)]
         verbose: bool,

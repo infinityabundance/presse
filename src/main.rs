@@ -40,12 +40,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dpi,
             ssim,
             palette,
+            jpeg_encoder,
             verbose,
         } => {
             // Resolve the transcoding backend up front: requesting a backend
             // that was not compiled in is an explicit error; a compiled-in
             // backend whose driver is missing warns and falls back to CPU.
-            let transcoder = resolve(acceleration)?;
+            // `--jpeg-encoder` selects the 4:2:0 codec for the CPU path.
+            let transcoder = resolve(acceleration, jpeg_encoder)?;
             let bar = ProgressBar::new(input.len() as u64);
             bar.set_style(
                 ProgressStyle::default_bar()

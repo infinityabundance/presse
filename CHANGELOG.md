@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`--jpeg-encoder`** (`press --jpeg-encoder`, off by default) — swap the
+  CPU JPEG encoder from the `image` crate's 4:4:4 to the pure-Rust
+  `jpeg-encoder` codec at YCbCr 4:2:0 with box-averaged chroma
+  (libjpeg's default model, AVX2 `simd`): smaller RGB output at the same
+  `-q` (−8% on the photo corpus at q50) and faster encodes. Grayscale
+  stays single-component. Chroma-aware per-channel SSIM added to the
+  native-image benchmark witness so the tradeoff is measured.
 - **Duplicate-image coalescing** — image streams that are semantically
   identical (same dictionary, same payload; `/Length` and the cosmetic
   `/Name` hint ignored, indirect `/ColorSpace`/`/SMask` references

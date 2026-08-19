@@ -149,7 +149,7 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
         doc,
         QualityMode::fixed(quality),
         verbose,
-        &CpuTranscoder,
+        &CpuTranscoder::default(),
         None,
         false,
     );

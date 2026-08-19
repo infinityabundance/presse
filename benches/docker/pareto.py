@@ -40,15 +40,31 @@ QUALITIES = [30, 50, 75]
 
 
 def ssim(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(Image.fromarray(a).convert("L").resize((64, 64), Image.BILINEAR), dtype=np.float64)
-    b = np.asarray(Image.fromarray(b).convert("L").resize((64, 64), Image.BILINEAR), dtype=np.float64)
-    n = a.size
-    ma, mb = a.mean(), b.mean()
-    va = ((a - ma) ** 2).sum() / n
-    vb = ((b - mb) ** 2).sum() / n
-    cov = ((a - ma) * (b - mb)).sum() / n
-    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
-    return ((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+    """The fidelity witness for one render pair: min over luma and the R/G/B
+    channels. Luma alone hides chroma degradation (a 4:4:4 -> 4:2:0 subsample
+    leaves Y untouched), so the stricter color witness is included — a
+    compressor that throws away chroma is judged on what it changed.
+    """
+    n = 64 * 64
+
+    def _one(a: np.ndarray, b: np.ndarray) -> float:
+        a = np.asarray(Image.fromarray(a).resize((64, 64), Image.BILINEAR), dtype=np.float64)
+        b = np.asarray(Image.fromarray(b).resize((64, 64), Image.BILINEAR), dtype=np.float64)
+        ma, mb = a.mean(), b.mean()
+        va = ((a - ma) ** 2).sum() / n
+        vb = ((b - mb) ** 2).sum() / n
+        cov = ((a - ma) * (b - mb)).sum() / n
+        c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+        return ((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+
+    rgb_a = np.asarray(Image.fromarray(a).convert("RGB"), dtype=np.float64)
+    rgb_b = np.asarray(Image.fromarray(b).convert("RGB"), dtype=np.float64)
+    luma = _one(
+        0.299 * rgb_a[..., 0] + 0.587 * rgb_a[..., 1] + 0.114 * rgb_a[..., 2],
+        0.299 * rgb_b[..., 0] + 0.587 * rgb_b[..., 1] + 0.114 * rgb_b[..., 2],
+    )
+    chroma = min(_one(rgb_a[..., i], rgb_b[..., i]) for i in range(3))
+    return min(luma, chroma)
 
 
 def page_count(pdf: Path) -> int:

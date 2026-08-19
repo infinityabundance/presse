@@ -55,6 +55,7 @@ libloading = { version = "0.8", optional = true }
 
 # Faster allocation for the many small buffers rayon workers create.
 mimalloc = "0.1"
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 
 [dev-dependencies]
 # Same major/minor as the main deps, shared by tests/ and examples/ (corpus generator)
