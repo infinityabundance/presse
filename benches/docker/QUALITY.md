@@ -139,13 +139,14 @@ native one is the stricter of the two:
 > render shows.
 
 Tools, compared at *equal measured fidelity* (SSIM thresholds, not equal
-quality numbers), `benches/docker/pareto.py`: presse (`-q 30/50/75`, ±
-`-d 150`), qpdf 12.3 (`--optimize-images --jpeg-quality`, explicitly does
-not resample), MuPDF 1.28 recompression (`clean -i -gggg -z
+quality numbers), `benches/docker/pareto.py`: presse (`-q 30/50/75` plus the
+full `-d {none,75,150,300,600} × -s {1.0,0.86,0.72}` cross matrix), qpdf
+12.3 (`--optimize-images --jpeg-quality`, explicitly does not resample),
+MuPDF 1.28 recompression (`clean -i -gggg -z
 --{color,gray}{,-lossless}-image-recompress-method jpeg:N`, recompress-only-
 when-smaller), pdf-optimizer 1.0 (MuPDF-based, `--dpi 0`), ghostscript
-`/screen…/prepress`. Sizes at SSIM ≥ 0.9999 (300 dpi render) on sampled
-pages:
+`/screen…/prepress`, and OCRmyPDF 17.10 (`--optimize 3 --jpeg-quality`,
+see below). Sizes at SSIM ≥ 0.9999 (300 dpi render) on sampled pages:
 
 | file | presse | qpdf | mutool | pdf-optimizer | gs /ebook |
 |---|---|---|---|---|---|
@@ -242,12 +243,25 @@ smallest / fastest per file:
 witness 0.86 on the scans (see the Pareto section). presse's `d75-s0.72`
 is the smallest full-fidelity (native ≥ 0.9999) cell on both scan files.
 
-OCRmyPDF 17.10 (`--optimize 3 --jpeg-quality`): recorded FAILED on this
-host (its optimizer hard-requires `pngquant`, and its tesseract needs the
-`hocr` config, neither installable without sudo here); the bench image
-installs both, so the container reproduces the full run. The lossless leg
-(`--optimize 1`) works where the source carries a text layer (−5.1% on an
-IRS form).
+OCRmyPDF 17.10 (`-m skip -l eng --output-type pdf --optimize 3 --jpeg-quality`)
+— measured once `pngquant` + the tesseract `eng`/`hocr` config were
+installed. Its optimizer is a real contender on some content:
+
+| file | OCRmyPDF q50 | vs the field at SSIM ≥ 0.9999 |
+|---|---|---|
+| arxiv_gpt3 (paper) | **2.57 MB** / 2.5 s / 1.0000 | smallest of any tool (presse q30 5.03, mutool 4.34, qpdf 4.53) |
+| irs_fw2 (scans) | 1.72 MB / 0.54 s / 1.0000 | smaller than presse (2.03) and mutool (2.54), just above qpdf (1.52) |
+| photos20 (photos) | 9.05 MB / 3.8 s / 1.0000 | presse `-s 0.86` is smaller (4.41) at 0.26 s |
+| irs_i1040 (126p scans) | **exit 4 — invalid output** | OCRmyPDF's own validator rejects its result ("The generated PDF is INVALID"); qpdf tolerates it with the same benign source-truncation warning every tool gets on this file |
+
+Quality is effectively flat in `--jpeg-quality` on non-JPEG-heavy docs
+(q30 = q50 = q75 on gpt3/irs_fw2 — the flag only governs JPEG
+recompression, and its quantization does the rest). Speed is 6–10×
+slower than presse on image-heavy files (photos20 3.8 vs 0.26 s). The
+irs_i1040 failure is not a harness artifact: the sweep runs it exactly
+as the CLI would, and its own validator exits 4 — a genuine validity
+finding the Pareto harness catches that a size-only comparison would
+have missed.
 
 ## The non-compressors
 
