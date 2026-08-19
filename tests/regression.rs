@@ -557,7 +557,7 @@ fn multi_image_roundtrip_is_well_formed_and_reencoded() {
     assert_eq!(loaded.get_pages().len(), 12, "all pages must survive");
 
     let mut image_count = 0;
-    for (_, obj) in loaded.objects.iter() {
+    for obj in loaded.objects.values() {
         if let Object::Stream(s) = obj
             && s.dict.get(b"Subtype").and_then(|x| x.as_name()).ok() == Some(b"Image".as_slice())
         {
@@ -747,7 +747,7 @@ fn rgba4_stream_is_normalized_in_chunks() {
 
     let loaded = assert_well_formed(&dir.join("rgba-post.pdf"));
     let mut reencoded = 0;
-    for (_, obj) in loaded.objects.iter() {
+    for obj in loaded.objects.values() {
         if let Object::Stream(s) = obj
             && s.dict.get(b"Subtype").and_then(|x| x.as_name()).ok() == Some(b"Image".as_slice())
         {
