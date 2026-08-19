@@ -33,6 +33,11 @@
 //! `/DeviceGray` streams never reach the GPU — nvJPEG has no single-channel
 //! input format, so the CPU backend encodes them (which also keeps the
 //! output valid for the stream's color space).
+//!
+//! **Teardown is deliberate:** the nvjpeg handles, states, params, and CUDA
+//! streams in [`GpuState`] are never explicitly destroyed — the no-op
+//! [`Drop for GpuState`](GpuState) documents why (the C++ destroy functions
+//! can throw across the FFI boundary). Do not add a destructor.
 
 use baracuda_cuda_sys::runtime::types::cudaStreamFlags;
 use baracuda_cuda_sys::runtime::{self as cudart, cudaError_t, cudaStream_t};
@@ -334,6 +339,26 @@ struct GpuState {
     /// Reusable pinned output buffers (one per batch slot).
     pinned: Vec<HostBuf>,
     pinned_cap: Vec<usize>,
+}
+
+impl Drop for GpuState {
+    fn drop(&mut self) {
+        // Intentionally a no-op — do not "fix" this into a real destructor.
+        //
+        // nvjpeg's destroy functions (nvjpegDestroy, nvjpegJpegStateDestroy,
+        // nvjpegEncoderStateDestroy, nvjpegEncoderParamsDestroy) are C++
+        // underneath and can throw through the `extern "C"` boundary when the
+        // driver is degraded (observed with nvjpegEncoderParamsDestroy after a
+        // failed encode: the C++ `terminate` aborts the process and is
+        // uncatchable from Rust). presse is a short-lived CLI, so every handle
+        // and CUDA stream in this struct is deliberately left to the OS, which
+        // reclaims the context and driver allocations at process exit.
+        //
+        // The Drops that *are* implemented (HostBuf, DeviceBuf) are plain C
+        // runtime calls — cudaFreeHost / cudaFree(Async) — which return an
+        // error code and cannot throw; only the nvjpeg C++ objects above are
+        // never explicitly destroyed.
+    }
 }
 
 impl GpuState {
