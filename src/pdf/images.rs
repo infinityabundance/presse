@@ -28,6 +28,79 @@ struct Downsample<'a> {
     placements: &'a Placements,
 }
 
+/// Quality selection for one `press` run.
+#[derive(Clone, Copy)]
+pub struct QualityMode {
+    /// `-q` as given; used when `ssim` is absent or ≥ 1.0 (the default:
+    /// byte-identical to the plain `-q` behavior).
+    fixed: u8,
+    /// `-ssim <target>`: quality derived from the calibration curve below.
+    ssim: Option<f64>,
+}
+
+impl QualityMode {
+    /// The plain `-q` mode (used by `merge --compress` / `convert --compress`).
+    pub fn fixed(quality: u8) -> Self {
+        Self {
+            fixed: quality,
+            ssim: None,
+        }
+    }
+
+    /// `press` construction: `-q` plus the optional `-ssim` target.
+    pub fn press(quality: u8, ssim: Option<f64>) -> Self {
+        Self {
+            fixed: quality,
+            ssim: ssim.filter(|t| *t < 1.0),
+        }
+    }
+
+    /// JPEG quality for one stream. `-ssim <1.0` maps the target through
+    /// [`calibrated_quality`]; otherwise `-q` is used as given.
+    fn effective(&self) -> u8 {
+        match self.ssim {
+            Some(target) => calibrated_quality(target),
+            None => self.fixed,
+        }
+    }
+}
+
+/// Measured native (512-window luma) SSIM of a JPEG re-encode vs its source
+/// on grainy gray scans — the worst-case reference content for JPEG, where
+/// artifacts are the most visible. Smooth photos and paper figures score
+/// far higher at the same quality, so this curve is conservative: content
+/// that is not grainy always *exceeds* the requested target. See
+/// `benches/docker/calibrate_ssim.py` and QUALITY.md "SSIM targets".
+const SSIM_CALIBRATION: [(u8, f64); 6] = [
+    (5, 0.6911),
+    (10, 0.8929),
+    (15, 0.9182),
+    (25, 0.9580),
+    (50, 0.9852),
+    (75, 0.9934),
+];
+
+/// Piecewise-linear inverse of [`SSIM_CALIBRATION`]: the JPEG quality whose
+/// measured SSIM is closest to `target`, clamped to [5, 90].
+fn calibrated_quality(target: f64) -> u8 {
+    let mut q = SSIM_CALIBRATION[0].0;
+    for w in SSIM_CALIBRATION.windows(2) {
+        let (qa, sa) = w[0];
+        let (qb, sb) = w[1];
+        if target <= sa {
+            q = qa;
+            break;
+        }
+        if target <= sb {
+            let t = (target - sa) / (sb - sa);
+            q = (qa as f64 + t * (qb as f64 - qa as f64)).round() as u8;
+            break;
+        }
+        q = qb;
+    }
+    q.clamp(5, 90)
+}
+
 /// Replace JPEG images in a document by a compressed version to the given quality.
 /// Only JPEG images are replaced, the other are skipped.
 ///
@@ -35,7 +108,13 @@ struct Downsample<'a> {
 /// `None` (or omitted) for the default behavior: images keep their source
 /// resolution.
 pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
-    compress_images_with(doc, quality, verbose, &CpuTranscoder, None);
+    compress_images_with(
+        doc,
+        QualityMode::fixed(quality),
+        verbose,
+        &CpuTranscoder,
+        None,
+    );
 }
 
 /// Replace JPEG images in a document using the given transcoding backend.
@@ -57,7 +136,7 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 ///    before serialization.
 pub fn compress_images_with<T: ImageTranscoder>(
     doc: &mut Document,
-    quality: u8,
+    mode: QualityMode,
     verbose: bool,
     transcoder: &T,
     dpi: Option<u32>,
@@ -99,7 +178,7 @@ pub fn compress_images_with<T: ImageTranscoder>(
         .into_par_iter()
         .map(|(id, stream)| {
             let stream =
-                reencode_image_stream(id, stream, quality, verbose, &cache, transcoder, downsample);
+                reencode_image_stream(id, stream, mode, verbose, &cache, transcoder, downsample);
             (id, stream)
         })
         .collect();
@@ -119,12 +198,23 @@ pub fn compress_images_with<T: ImageTranscoder>(
 fn reencode_image_stream<T: ImageTranscoder>(
     id: ObjectId,
     mut stream: Stream,
-    quality: u8,
+    mode: QualityMode,
     verbose: bool,
     cache: &TranscodeCache,
     transcoder: &T,
     downsample: Option<Downsample<'_>>,
 ) -> Stream {
+    // Resolve `-q` / `-ssim` to the JPEG quality for this stream. In ssim
+    // mode the calibration is deterministic, so the dedup key (which
+    // includes the quality) stays valid.
+    let quality = mode.effective();
+    if let Some(target) = mode.ssim {
+        verbose!(
+            verbose,
+            "[img {:?}] → ssim target {target} → q{quality}",
+            id
+        );
+    }
     let color_space_raw = stream
         .dict
         .get(b"ColorSpace")
@@ -589,6 +679,30 @@ fn resize_raw(classified: &RawPixels<'_>, width: u32, height: u32, tw: u32, th: 
             let img =
                 image::RgbImage::from_raw(width, height, rgb.clone()).expect("validated dims");
             image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle).into_raw()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calibrated_quality;
+
+    #[test]
+    fn calibration_maps_ssim_targets_to_quality() {
+        // The two documented presets land in the aggressive range.
+        assert_eq!(calibrated_quality(0.86), 9);
+        assert_eq!(calibrated_quality(0.72), 6);
+        // Targets above the measured curve clamp to the top quality.
+        assert!(calibrated_quality(0.9999) >= 75);
+        assert_eq!(calibrated_quality(1.0), 75);
+        // Targets below the curve clamp to the floor.
+        assert_eq!(calibrated_quality(0.01), 5);
+        // Monotonic: a stricter target never yields a lower quality.
+        let mut prev = 0;
+        for t in [0.5, 0.7, 0.86, 0.95, 0.99] {
+            let q = calibrated_quality(t);
+            assert!(q >= prev, "q({t})={q} < previous {prev}");
+            prev = q;
         }
     }
 }

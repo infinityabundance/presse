@@ -18,7 +18,7 @@ use std::process::Command;
 use image::GrayImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
-use presse::pdf::images::{compress_images, compress_images_with};
+use presse::pdf::images::{QualityMode, compress_images, compress_images_with};
 use presse::pdf::writer::{compress_and_save_pdf, save_pdf};
 use presse::transcode::{
     Acceleration, CpuTranscoder, FallbackTranscoder, ImageTranscoder, Input, RuntimeTranscoder,
@@ -977,7 +977,13 @@ fn dpi_downsampling_resizes_placed_images_and_updates_dims() {
         false,
         (100.0, 100.0),
     );
-    compress_images_with(&mut post.0, QUALITY, false, &CpuTranscoder, Some(150));
+    compress_images_with(
+        &mut post.0,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder,
+        Some(150),
+    );
     compress_and_save_pdf(
         &mut post.0,
         dir.join("dpi-post.pdf").to_str().unwrap(),
@@ -1025,7 +1031,13 @@ fn dpi_above_effective_resolution_keeps_source_size() {
         false,
         (100.0, 100.0),
     );
-    compress_images_with(&mut doc.0, QUALITY, false, &CpuTranscoder, Some(600));
+    compress_images_with(
+        &mut doc.0,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder,
+        Some(600),
+    );
     compress_and_save_pdf(
         &mut doc.0,
         dir.join("dpi-noop.pdf").to_str().unwrap(),
@@ -1134,7 +1146,13 @@ fn gpu_failure_falls_back_to_cpu_identically() {
     // threshold 0 → every stream consults the (failing) GPU first.
     let fallback = FallbackTranscoder::new(Some(FailingGpu), 0);
     let mut fb_doc = build();
-    compress_images_with(&mut fb_doc, QUALITY, false, &fallback, None);
+    compress_images_with(
+        &mut fb_doc,
+        QualityMode::fixed(QUALITY),
+        false,
+        &fallback,
+        None,
+    );
 
     let (cpu_path, fb_path) = (
         dir.join("gpu-fallback-pre.pdf"),
@@ -1292,7 +1310,13 @@ fn cpu_transcoder_default_parity() {
     let mut plain = build();
     compress_images(&mut plain, QUALITY, false);
     let mut explicit = build();
-    compress_images_with(&mut explicit, QUALITY, false, &CpuTranscoder, None);
+    compress_images_with(
+        &mut explicit,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder,
+        None,
+    );
 
     let (p_path, e_path) = (
         dir.join("parity-plain.pdf"),
@@ -1331,7 +1355,13 @@ fn dpi_cap_never_upscales_and_matches_formula() {
             false,
             (*pw, *ph),
         );
-        compress_images_with(&mut doc.0, QUALITY, false, &CpuTranscoder, Some(*dpi));
+        compress_images_with(
+            &mut doc.0,
+            QualityMode::fixed(QUALITY),
+            false,
+            &CpuTranscoder,
+            Some(*dpi),
+        );
         compress_and_save_pdf(
             &mut doc.0,
             dir.join(format!("dpi-prop-{i}.pdf")).to_str().unwrap(),
@@ -1370,7 +1400,13 @@ fn xref_is_well_formed_and_all_objects_reachable() {
     for _ in 0..8 {
         add_image_page(&mut doc, pages_id, photoish_rgb(160, 160), 160, 160, false);
     }
-    compress_images_with(&mut doc, QUALITY, false, &CpuTranscoder, Some(150));
+    compress_images_with(
+        &mut doc,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder,
+        Some(150),
+    );
     compress_and_save_pdf(
         &mut doc,
         dir.join("reach-post.pdf").to_str().unwrap(),
@@ -1476,7 +1512,13 @@ fn grayscale_jpeg_stays_single_component() {
 
     let (mut doc, pages_id) = new_doc();
     add_image_page(&mut doc, pages_id, gradient_gray(128, 128), 128, 128, true);
-    compress_images_with(&mut doc, QUALITY, false, &CpuTranscoder, None);
+    compress_images_with(
+        &mut doc,
+        QualityMode::fixed(QUALITY),
+        false,
+        &CpuTranscoder,
+        None,
+    );
     compress_and_save_pdf(&mut doc, dir.join("gray-post.pdf").to_str().unwrap(), false).unwrap();
 
     let loaded = assert_well_formed(&dir.join("gray-post.pdf"));
@@ -1514,7 +1556,13 @@ fn concurrent_compression_is_deterministic_and_valid() {
         .map(|i| {
             let path = dir.join(format!("conc-{i}.pdf"));
             let mut doc = build();
-            compress_images_with(&mut doc, QUALITY, false, &CpuTranscoder, None);
+            compress_images_with(
+                &mut doc,
+                QualityMode::fixed(QUALITY),
+                false,
+                &CpuTranscoder,
+                None,
+            );
             compress_and_save_pdf(&mut doc, path.to_str().unwrap(), false).unwrap();
             path
         })
@@ -1526,4 +1574,109 @@ fn concurrent_compression_is_deterministic_and_valid() {
         assert_eq!(bytes, first, "concurrent runs must be byte-identical");
         assert_well_formed(path);
     }
+}
+
+/// `-ssim <target>` maps to a lower JPEG quality than the default (smaller
+/// output), stays structurally valid, and renders recognizably. The
+/// calibration guarantees the target on grainy content; photos exceed it,
+/// so the visual gate is lenient by design.
+#[test]
+fn ssim_target_reduces_size_and_stays_valid() {
+    let dir = test_dir();
+
+    let build = |mode: QualityMode, name: &str| {
+        let mut doc = new_doc();
+        for _ in 0..4 {
+            add_image_page(&mut doc.0, doc.1, gradient_gray(256, 256), 256, 256, true);
+        }
+        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None);
+        compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
+        std::fs::metadata(dir.join(name)).unwrap().len()
+    };
+
+    let default_size = build(QualityMode::fixed(QUALITY), "ssim-pre.pdf");
+    let relaxed = build(QualityMode::press(QUALITY, Some(0.72)), "ssim-post.pdf");
+    assert!(
+        relaxed < default_size,
+        "-ssim 0.72 must compress harder than the default: {relaxed} vs {default_size}"
+    );
+
+    let loaded = assert_well_formed(&dir.join("ssim-post.pdf"));
+    assert_eq!(loaded.get_pages().len(), 4, "all pages must survive");
+    assert_visual_similarity(&dir, "ssim", 0.85);
+}
+
+/// `-ssim` ≥ 1.0 is the default behavior: `-q` as given, byte-identical
+/// to not passing the flag at all.
+#[test]
+fn ssim_one_keeps_default_quality() {
+    let dir = test_dir();
+
+    let run = |mode: QualityMode, name: &str| {
+        let mut doc = new_doc();
+        add_image_page(&mut doc.0, doc.1, photoish_rgb(200, 200), 200, 200, false);
+        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, None);
+        compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
+        std::fs::read(dir.join(name)).unwrap()
+    };
+
+    let plain = run(QualityMode::fixed(QUALITY), "ssim1-plain.pdf");
+    let with_flag = run(QualityMode::press(QUALITY, Some(1.0)), "ssim1-flag.pdf");
+    assert_eq!(
+        plain, with_flag,
+        "-ssim 1.0 must equal the plain -q behavior"
+    );
+}
+
+/// The two quality knobs compose: `-d 150 -s 0.72` both resamples *and*
+/// compresses harder — dimensions shrink to the dpi cap and the output is
+/// smaller than either knob alone.
+#[test]
+fn dpi_and_ssim_compose() {
+    let dir = test_dir();
+
+    let run = |mode: QualityMode, dpi: Option<u32>, name: &str| -> (u64, u32, u32) {
+        let mut doc = new_doc();
+        // 600 px placed at 200 pt = 216 dpi effective.
+        add_image_page_at(
+            &mut doc.0,
+            doc.1,
+            photoish_rgb(600, 600),
+            600,
+            600,
+            false,
+            (200.0, 200.0),
+        );
+        compress_images_with(&mut doc.0, mode, false, &CpuTranscoder, dpi);
+        compress_and_save_pdf(&mut doc.0, dir.join(name).to_str().unwrap(), false).unwrap();
+        let loaded = Document::load(dir.join(name)).unwrap();
+        let (_, _, dict) = &find_image_streams(&loaded)[0];
+        let w = dict.get(b"Width").and_then(|x| x.as_i64()).ok().unwrap() as u32;
+        let h = dict.get(b"Height").and_then(|x| x.as_i64()).ok().unwrap() as u32;
+        (std::fs::metadata(dir.join(name)).unwrap().len(), w, h)
+    };
+
+    let (base_size, _, _) = run(QualityMode::fixed(QUALITY), None, "compose-base.pdf");
+    let (d_size, dw, _) = run(QualityMode::fixed(QUALITY), Some(150), "compose-d.pdf");
+    let (s_size, _, _) = run(
+        QualityMode::press(QUALITY, Some(0.72)),
+        None,
+        "compose-s.pdf",
+    );
+    let (ds_size, dsw, _) = run(
+        QualityMode::press(QUALITY, Some(0.72)),
+        Some(150),
+        "compose-ds.pdf",
+    );
+
+    assert_eq!(
+        dw, 417,
+        "-d 150 on a 216-dpi placement → round(200·150/72) = 417 px"
+    );
+    assert_eq!(dsw, 417, "dpi cap applies regardless of the ssim target");
+    assert!(
+        ds_size < d_size && ds_size < s_size && s_size < base_size,
+        "composed dpi+ssim must beat each knob alone: base {base_size}, d {d_size}, s {s_size}, ds {ds_size}"
+    );
+    assert_well_formed(&dir.join("compose-ds.pdf"));
 }

@@ -43,6 +43,24 @@ pub enum Commands {
         )]
         dpi: Option<u32>,
 
+        /// Target output fidelity as measured SSIM (0–1). Lower = smaller
+        /// and faster encodes. Default 1.0: use -q as given.
+        #[arg(
+            short = 's',
+            long,
+            value_name = "SSIM",
+            value_parser = |s: &str| -> Result<f64, String> {
+                let v: f64 = s.parse().map_err(|_| "not a number".to_string())?;
+                if (0.01..=1.0).contains(&v) {
+                    Ok(v)
+                } else {
+                    Err("must be between 0.01 and 1.0".to_string())
+                }
+            },
+            long_help = "Target output fidelity, as the SSIM of each re-encoded image vs its\nsource, measured on a 512-px analysis window. The mapping is calibrated on\ngrainy scans — the worst case for JPEG, where artifacts are most visible\n— so smoother content (photos, paper figures) always *exceeds* the\ntarget. Lower targets give smaller and faster encodes.\n\n  -ssim 1.0   – default: use -q as given (no calibration)\n  -ssim 0.86  – ~q9 on the calibration content (aggressive size cut)\n  -ssim 0.72  – ~q6 (very aggressive)\n\nAchieved SSIM varies with content and is reported by the benchmark\n(QUALITY.md \"SSIM targets\").",
+        )]
+        ssim: Option<f64>,
+
         // Details during the compression process --> sizes comparison before & after
         #[arg(short, long, default_value_t = false)]
         verbose: bool,

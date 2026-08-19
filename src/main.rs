@@ -12,7 +12,7 @@ mod transcode;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use pdf::builder::image_to_pdf;
-use pdf::images::{compress_images, compress_images_with};
+use pdf::images::{QualityMode, compress_images, compress_images_with};
 use pdf::merger::merge;
 use pdf::reader::{
     get_compression_ratio_in_percent, get_pdf_size_in_kilobytes, load_input_as_pdf, load_pdf,
@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quality,
             acceleration,
             dpi,
+            ssim,
             verbose,
         } => {
             // Resolve the transcoding backend up front: requesting a backend
@@ -84,7 +85,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                compress_images_with(&mut doc, quality, verbose, &transcoder, dpi);
+                compress_images_with(
+                    &mut doc,
+                    QualityMode::press(quality, ssim),
+                    verbose,
+                    &transcoder,
+                    dpi,
+                );
 
                 // Compressing the document
                 let output = resolve_press_path_output(file_path, &output);
