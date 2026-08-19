@@ -82,4 +82,22 @@ for pdf in "$CORPUS_DIR"/*.pdf; do
     printf "%-14s %10d %10d %10s %10s %10s\n" "$name" "$size_in" "$size_out" "$wall_s" "$mbps" "$rss"
 done
 
+# ---------------------------------------------------------------------------
+# Per-corpus-file breakdown: mutool clean -gggg -z (lossless repack)
+# ---------------------------------------------------------------------------
+echo "==> per-file breakdown: mutool clean -gggg -z"
+printf "%-14s %10s %10s %10s\n" corpus "in(B)" "mu-out(B)" "mu-wall(s)"
+
+for pdf in "$CORPUS_DIR"/*.pdf; do
+    name=$(basename "$pdf" .pdf)
+    mu_out="$RESULTS_DIR/mu-$name.pdf"
+    size_in=$(stat -c %s "$pdf")
+    t0=$(date +%s.%N)
+    mutool clean -gggg -z "$pdf" "$mu_out" > /dev/null 2>&1 || true
+    t1=$(date +%s.%N)
+    mu_s=$(awk "BEGIN{printf \"%.3f\", $t1-$t0}")
+    mu_size=$(stat -c %s "$mu_out" 2> /dev/null || echo 0)
+    printf "%-14s %10d %10d %10s\n" "$name" "$size_in" "$mu_size" "$mu_s"
+done
+
 echo "==> done — timings JSON: $RESULTS_DIR/hyperfine.json"

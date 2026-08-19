@@ -4,8 +4,8 @@ Measured on a 16-core machine with the release build
 (`RUSTFLAGS="-C target-cpu=native"`), `presse press -q 50`.
 
 For how output quality (SSIM, resolution preservation) relates to these
-speeds — including ghostscript and the non-compressing Rust tools unpdf and
-pdfrs — see [`QUALITY.md`](QUALITY.md).
+speeds — including ghostscript, the lossless-repack `mutool clean`, and the
+non-compressing Rust tools unpdf and pdfrs — see [`QUALITY.md`](QUALITY.md).
 
 ## Performance work
 

@@ -23,9 +23,10 @@ RUN cargo build --release \
 FROM debian:bookworm-slim
 
 # hyperfine for timing, poppler-utils for PDF validation (pdfinfo/pdftoppm),
+# mupdf-tools for the mutool clean -gggg -z (lossless repack) comparison,
 # `time` for peak-RSS measurement.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends hyperfine poppler-utils time \
+ && apt-get install -y --no-install-recommends hyperfine poppler-utils mupdf-tools time \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/target/release/presse /usr/local/bin/presse
