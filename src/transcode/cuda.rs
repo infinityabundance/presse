@@ -47,6 +47,7 @@ use crate::transcode::{ImageRef, ImageTranscoder, Input, TranscodeError, jpeg_co
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// `nvjpegInputFormat_t` for the interleaved-RGB fallback encode.
@@ -943,7 +944,8 @@ impl GpuState {
 /// OS to reclaim at process exit.
 #[derive(Debug)]
 pub struct CudaTranscoder {
-    tx: Sender<Job>,
+    tx: Option<Sender<Job>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl CudaTranscoder {
@@ -955,30 +957,58 @@ impl CudaTranscoder {
         nvjpeg::nvjpeg()
             .map_err(|e| TranscodeError::Unavailable(format!("nvJPEG library: {e}")))?;
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("presse-gpu".into())
             .spawn(move || consumer_main(rx))
             .map_err(|e| TranscodeError::Unavailable(format!("spawn GPU consumer: {e}")))?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for CudaTranscoder {
+    fn drop(&mut self) {
+        // Shut the consumer down and join it *before* the process exits.
+        // The consumer thread is detached from the rayon producers, and a
+        // detached thread whose CUDA calls are still in flight while the
+        // process tears down segfaults (observed: 3/10 crashes on a
+        // many-image document; the nvjpeg teardown no-op above does not
+        // cover thread lifetime). Closing the channel makes the consumer
+        // exit its recv loop; by the time `drop` runs, every queued job has
+        // been answered, so the join waits only for the consumer to unwind
+        // its (leaked-by-design) state. CUDA is never touched after this
+        // returns.
+        drop(self.tx.take()); // closes the job channel
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 fn consumer_main(rx: Receiver<Job>) {
-    // Initialize the CUDA context + nvjpeg state *before* waiting for jobs:
-    // this is the ~100 ms one-shot cost, and doing it here lets it overlap
-    // the PDF load/parse on the calling thread. On failure, every queued
-    // job is answered with the error and the caller's FallbackTranscoder
-    // routes each stream to the CPU backend.
-    let mut gpu = match GpuState::new() {
-        Ok(gpu) => gpu,
-        Err(e) => {
-            while let Ok(job) = rx.recv() {
-                let _ = job.reply.send(Err(e.clone()));
-            }
-            return;
-        }
-    };
+    // The CUDA context + nvjpeg state are initialized lazily on the first
+    // job. Documents that route nothing to the GPU (the common case at the
+    // 1 MiB routing threshold) never touch the driver, and the ~100 ms
+    // context init is paid once, with jobs already in hand. On failure,
+    // every queued job is answered with the error and the caller's
+    // FallbackTranscoder routes each stream to the CPU backend.
+    let mut gpu: Option<GpuState> = None;
     while let Ok(first) = rx.recv() {
+        if gpu.is_none() {
+            match GpuState::new() {
+                Ok(g) => gpu = Some(g),
+                Err(e) => {
+                    let _ = first.reply.send(Err(e.clone()));
+                    while let Ok(job) = rx.recv() {
+                        let _ = job.reply.send(Err(e.clone()));
+                    }
+                    return;
+                }
+            }
+        }
+        let gpu = gpu.as_mut().unwrap();
         let mut batch = Vec::with_capacity(BATCH_MAX);
         batch.push(first);
         while batch.len() < BATCH_MAX {
@@ -1020,13 +1050,16 @@ impl ImageTranscoder for CudaTranscoder {
             Input::Pixels(ImageRef::Luma8 { .. }) => unreachable!("guarded above"),
         };
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.tx
-            .send(Job {
-                input: job_input,
-                quality,
-                reply: reply_tx,
-            })
-            .map_err(|_| TranscodeError::Unavailable("GPU consumer is gone".into()))?;
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| TranscodeError::Unavailable("GPU consumer is gone".into()))?;
+        tx.send(Job {
+            input: job_input,
+            quality,
+            reply: reply_tx,
+        })
+        .map_err(|_| TranscodeError::Unavailable("GPU consumer is gone".into()))?;
         reply_rx
             .recv()
             .map_err(|_| TranscodeError::Unavailable("GPU consumer is gone".into()))?
