@@ -25,6 +25,20 @@ All notable changes to this project will be documented in this file.
   scans): exact palette when ≤256 unique colors (lossless), deterministic
   median-cut above that, accepted only above a 0.9999 native-image SSIM
   gate; the smallest of original / JPEG / indexed wins per image.
+- **`--raster-classify`** (`press --raster-classify`, off by default) — a
+  raster classifier (adaptive Otsu threshold, connected-component density,
+  color statistics on a bounded ≤1024-px sample window) routes bitonal
+  text/rules to a lossless 1-bit CCITT Group 4 `/ImageMask` stencil (an
+  RGB text page → a few KB of G4, decoded pixel-identically by viewers)
+  and flat-color figures to the `/Indexed` candidate; photos and mixed
+  pages stay on the JPEG path. Conservative by design: only mostly
+  black-and-white rasters with glyph-sized components are masked. The
+  smallest of original / JPEG / indexed / mask wins per image.
+- **`--recompress-flate`** (`press --recompress-flate`, off by default) —
+  qpdf-style structural recompression: existing `/FlateDecode` streams are
+  decoded and re-encoded at the writer's level 9, each kept only when
+  smaller. Lossless (no content-byte changes); recovers the level-6-vs-9
+  gap form tools leave behind (irs_fw2 corpus: 1.81 → 1.34 MB).
 - **Flate-wrapped JPEG** — retained or re-encoded DCT streams that shrink
   under zlib are stored as `[FlateDecode, DCTDecode]` when the full flate
   result is smaller (OCRmyPDF-style trick).

@@ -3,15 +3,20 @@ use std::fs::File;
 
 use crate::pdf::images::zlib_encode;
 
-/// qpdf's structural trick (`--recompress-flate`): existing `FlateDecode`
-/// streams are usually stored at a lower compression level than this writer
-/// uses (form tools write ~level 6; we write level 9), so decoding and
-/// re-encoding them shrinks the file without touching a single content
-/// byte. Only pure-Flate streams (a `FlateDecode` name or a single-element
-/// `[FlateDecode]` array) with no `/DecodeParms` are touched — DCT/LZW/
-/// multi-filter chains and predictor-parameterized streams are left alone,
-/// as is anything that fails to decompress. Returns the number of streams
-/// recompressed.
+/// Structural recompression (`--recompress-flate`).
+///
+/// **Design rationale.** Form tools and older writers store `FlateDecode`
+/// streams at a lower compression level than this writer uses (~6 vs our
+/// level 9), so decoding and re-encoding the *same bytes* shrinks the file
+/// without touching a single content byte — qpdf's `--recompress-flate`
+/// trick, recovered here at the writer level (on the irs_fw2 scan corpus:
+/// qpdf's 1.81 → 1.34 MB). Only pure-Flate streams (a `FlateDecode` name or
+/// a single-element `[FlateDecode]` array) with no `/DecodeParms` are
+/// touched — DCT/LZW/multi-filter chains and predictor-parameterized
+/// streams are left alone, as is anything that fails to decompress — and,
+/// like every candidate in this codebase, a re-encoded stream is kept only
+/// when it is strictly smaller, so the pass is idempotent and can never
+/// grow a file. Returns the number of streams recompressed.
 ///
 /// Losslessness is structural: Flate decode + re-encode is bit-exact on
 /// the decoded bytes, so pixels, text, metadata and fonts are unchanged;

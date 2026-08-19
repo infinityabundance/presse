@@ -4,7 +4,8 @@
 Compares compressors at *equal measured fidelity* (SSIM of pdftoppm renders
 at multiple DPIs), not at equal arbitrary quality numbers:
 
-  presse          press -q <q> [-d <dpi>]
+  presse          press -q <q> [-d <dpi>] [--palette] [--raster-classify]
+                  [--recompress-flate]
   ghostscript     pdfwrite -dPDFSETTINGS=/<screen|ebook|printer|prepress>
   qpdf            --optimize-images --jpeg-quality=<q> --object-streams=generate
   mutool          clean -i -gggg -z --{color,gray}{,-lossless}-image-recompress-method jpeg:<q>
@@ -106,6 +107,19 @@ def tool_settings(tools: list[str]) -> list[tuple[str, str, list[str]]]:
         out.append(("presse", f"q{q}", ["{presse}", "press", "-q", str(q), "{in}", "-o", "{out}"]))
         out.append(("presse", f"q{q}-palette", ["{presse}", "press", "-q", str(q), "--palette",
                                                   "{in}", "-o", "{out}"]))
+        # Representation-selection flags: the classifier (bitonal text ->
+        # 1-bit CCITT G4 /ImageMask, flat-color -> /Indexed) and the
+        # structural Flate recompression, alone and combined.
+        out.append(("presse", f"q{q}-classify", ["{presse}", "press", "-q", str(q), "--raster-classify",
+                                                  "{in}", "-o", "{out}"]))
+        out.append(("presse", f"q{q}-reflate", ["{presse}", "press", "-q", str(q), "--recompress-flate",
+                                                  "{in}", "-o", "{out}"]))
+        out.append(("presse", f"q{q}-classify-reflate", ["{presse}", "press", "-q", str(q),
+                                                           "--raster-classify", "--recompress-flate",
+                                                           "{in}", "-o", "{out}"]))
+        out.append(("presse", f"q{q}-palette-classify", ["{presse}", "press", "-q", str(q),
+                                                           "--palette", "--raster-classify",
+                                                           "{in}", "-o", "{out}"]))
         out.append(("qpdf", f"q{q}", ["qpdf", "--optimize-images", f"--jpeg-quality={q}",
                                       "--object-streams=generate", "{in}", "{out}"]))
         out.append(("mutool", f"jpeg:{q}", ["mutool", "clean", "-i", "-gggg", "-z",

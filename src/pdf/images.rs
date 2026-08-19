@@ -34,6 +34,17 @@
 //!    don't deflate, but padded/progressive JPEGs occasionally do; the
 //!    `[FlateDecode, DCTDecode]` chain is used only when the complete flate
 //!    result is smaller.
+//! 7. **`--raster-classify`** — opt-in representation selection (default
+//!    off): the raster classifier (`pdf::classify`) decides what each
+//!    decoded image actually *is* before the size gate runs. Bitonal
+//!    text/rules get a 1-bit CCITT G4 `/ImageMask` stencil (`pdf::fax`) —
+//!    the representation a document compressor should use instead of
+//!    paying photographic cost — flat-color figures get the `/Indexed`
+//!    candidate, and photos / mixed pages stay on the JPEG path. The
+//!    classifier's routing, not a free-for-all: the indexed candidate is
+//!    offered only to `FlatColor` content under this flag, so it can never
+//!    turn a photo into a palette. The smallest of original / JPEG /
+//!    indexed / mask wins per image.
 
 use std::collections::HashMap;
 use std::io::Write;

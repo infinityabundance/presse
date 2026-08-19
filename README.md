@@ -125,6 +125,8 @@ presse merge *.png *.pdf
 | `-s, --ssim` | `1.0` | Target output fidelity as measured SSIM (calibrated on grainy scans — the worst case for JPEG — so smoother content exceeds the target); lower = smaller and faster. `1.0` = use `-q` as given |
 | `--palette` | `false` | Also build an `/Indexed` palette candidate for eligible flat-color images (figures, charts, scans) and keep the smallest of original / JPEG / indexed; exact palettes are lossless, lossy ones are gated on 0.9999 native SSIM |
 | `--jpeg-encoder` | `false` | Use the pure-Rust `jpeg-encoder` codec (YCbCr 4:2:0, box-averaged chroma — libjpeg's default model, which Ghostscript/qpdf use) instead of the `image` crate's 4:4:4 encoder; smaller RGB output at the same `-q`, faster, but opt-in because luminance-SSIM courts don't see chroma loss |
+| `--raster-classify` | `false` | Run the raster classifier on every decoded image: bitonal text/rules stored as a photographic RGB raster are re-stored as a lossless 1-bit CCITT G4 `/ImageMask` stencil (an RGB page → a few KB of G4); flat-color figures get the `/Indexed` palette candidate; photos and mixed pages are never masked. The smallest of original / JPEG / indexed / mask wins per image |
+| `--recompress-flate` | `false` | qpdf-style structural recompression: decode existing `/FlateDecode` streams and re-encode them at the writer's level 9, keeping each only when smaller. Lossless (no content-byte changes); recovers the compression-level gap form tools leave behind |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -143,6 +145,8 @@ presse press scans.pdf -d 75               # ~screen: 75 dpi cap
 presse press deck.pdf -s 0.86              # ~q9: fidelity-targeted, 60% smaller on photos
 presse press figures.pdf --palette         # also try indexed-color palettes
 presse press photos.pdf --jpeg-encoder     # libjpeg-style 4:2:0 chroma (smaller, faster)
+presse press scans.pdf --raster-classify   # bitonal pages -> 1-bit CCITT G4 masks
+presse press forms.pdf --recompress-flate  # re-encode existing Flate streams at level 9
 ```
 
 ### Chroma subsampling (`--jpeg-encoder`)
@@ -189,6 +193,43 @@ median-cut quantizer and are accepted only above a 0.9999 native-image SSIM
 gate, so a lossy palette can never visibly degrade a figure. Photos
 effectively never qualify. The smallest of original / JPEG / indexed wins
 per image. Only `press` takes the flag today.
+
+### Raster classification (`--raster-classify`)
+
+A scanned page stored as one RGB raster is usually not a photograph — it
+is text and rules on paper, and the JPEG representation pays photographic
+cost for document content. `--raster-classify` (off by default) runs a
+small classifier on every decoded image — an adaptive Otsu threshold,
+4-connected-component density and color statistics, all on a bounded
+sample window (≤1024 px on the long edge) so a 28 MB scan classifies in
+one pass — and routes the content:
+
+- **Bitonal text / rules** → a lossless 1-bit CCITT Group 4 `/ImageMask`
+  stencil (painted in the current color): an RGB text page becomes a few
+  KB of G4, decoded pixel-identically by every viewer.
+- **Flat-color figures** → the `/Indexed` palette candidate.
+- **Photos / mixed pages** → the JPEG path (the within-image split into
+  mask + continuous-tone layers is future work).
+
+The decision is deliberately conservative — an image is masked only when
+it is *mostly* black-and-white with glyph-sized components — so photos and
+colored figures are never masked. The mask drops color and anti-aliasing
+(bitonal content is black-on-white by definition), which is why the flag
+is opt-in rather than the default. The smallest of original / JPEG /
+indexed / mask wins per image. Only `press` takes the flag today.
+
+### Structural recompression (`--recompress-flate`)
+
+Form tools and older writers store `/FlateDecode` streams at a lower
+compression level than this writer uses, so decoding and re-encoding the
+*same bytes* shrinks the file without touching a single content byte —
+qpdf's `--recompress-flate` trick (on the irs_fw2 scan corpus: qpdf's
+1.81 → 1.34 MB). Only pure-Flate streams with no `/DecodeParms` are
+touched (DCT/LZW/multi-filter chains and anything that fails to
+decompress are left alone), each re-encoded stream is kept only when
+smaller, and the pass is lossless: pixels, text, metadata and fonts are
+unchanged, only the compressed representation differs. Only `press` takes
+the flag today.
 
 ### Merge — `presse merge`
 
