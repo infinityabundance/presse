@@ -26,8 +26,9 @@ judged against what they actually produce.
   it shrank 62 of the 99 corpus files that produced output (median −6.3% on
   the shrinkers) and *grew* the other 37, with image-heavy PDFs barely
   moving (photos20 12.08 → 12.07 MB). Per-file it is fast (0.015 s median),
-  but the commonly-recommended `-gggg` duplicate-scan is ~O(n²): 200+ s on
-  the two large spec documents, where the plain `-z` repack takes 0.1–0.6 s.
+  but the commonly-recommended `-gggg` duplicate-scan shows severe
+  superlinear scaling in this corpus: 200+ s on the two large spec
+  documents, where the plain `-z` repack takes 0.1–0.6 s.
 
 ## Methodology
 
@@ -109,11 +110,11 @@ produced byte-identical files (0 size mismatches in 99/99) with the same
 62/37 split.
 
 Speed is bimodal. Per-file median is 0.015 s — faster than presse — but the
-`-gggg` duplicate-object scan is ~O(n²): `specs_pdf32000.pdf` 210 s,
-`specs_pdfref17old.pdf` 352 s (killed, no output), `irs_i1040.pdf` 70 s,
-versus 0.1–0.6 s for the same files with the plain `-z` repack. Total over
-the corpus: 692 s (worst of any tool here, driven entirely by that tail;
-340 s excluding the killed file).
+`-gggg` duplicate-object scan scales severely superlinearly in this corpus:
+`specs_pdf32000.pdf` 210 s, `specs_pdfref17old.pdf` 352 s (killed, no
+output), `irs_i1040.pdf` 70 s, versus 0.1–0.6 s for the same files with the
+plain `-z` repack. Total over the corpus: 692 s (worst of any tool here,
+driven entirely by that tail; 340 s excluding the killed file).
 
 ## Speed in context (100-file corpus, excluding the 60 s spec outlier)
 
@@ -127,11 +128,11 @@ the corpus: 692 s (worst of any tool here, driven entirely by that tail;
 | ghostscript /ebook | compress (resolution-lossy) | 293 s | 0.152 s |
 | mutool clean -gggg -z | lossless repack | 692 s¹ | 0.015 s |
 
-¹ dominated by the ~O(n²) `-gggg` scan on `specs_pdfref17old.pdf` (killed
-without output; 352 s in the original run, still running when re-measured
-under a 600 s cap) and `specs_pdf32000.pdf` (210 s); excluding the killed
-file the total is 340 s. The plain `-z` repack is 0.1–0.6 s on the same
-files.
+¹ dominated by the `-gggg` duplicate scan's severe superlinear scaling on
+`specs_pdfref17old.pdf` (killed without output; 352 s in the original run,
+still running when re-measured under a 600 s cap) and `specs_pdf32000.pdf`
+(210 s); excluding the killed file the total is 340 s. The plain `-z`
+repack is 0.1–0.6 s on the same files.
 
 ## Warm-batch note
 
