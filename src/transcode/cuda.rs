@@ -377,20 +377,25 @@ impl GpuState {
             // used; the default (`nvjpegCreateSimple`) is the fallback on
             // older nvJPEG builds.
             let mut handle = ptr::null_mut();
-            let backend_ok = if let Ok(pfn) = lib.nvjpeg_create_ex() {
-                check(pfn(
+            let mut gpu_hybrid = false;
+            if let Ok(pfn) = lib.nvjpeg_create_ex() {
+                let st = pfn(
                     nvjpeg::nvjpegBackend_t::GpuHybrid,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     0,
                     &mut handle,
-                ))
-                .is_ok()
-                    && !handle.is_null()
-            } else {
-                false
-            };
-            if !backend_ok {
+                );
+                gpu_hybrid = st.0 == 0 && !handle.is_null();
+                if !gpu_hybrid {
+                    eprintln!(
+                        "warning: nvjpegCreateEx(GPU-hybrid) failed (status {}); \
+                         using the default backend",
+                        st.0
+                    );
+                }
+            }
+            if !gpu_hybrid {
                 let pfn = lib
                     .nvjpeg_create_simple()
                     .map_err(|e| TranscodeError::Unavailable(format!("nvjpegCreateSimple: {e}")))?;
