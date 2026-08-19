@@ -20,15 +20,15 @@
 //! back out for every image). Only the compressed bitstreams come back to
 //! the host, through a reusable pinned-memory pool.
 //!
-//! The handle is created with the GPU-hybrid backend (`nvjpegCreate` with
-//! `NVJPEG_BACKEND_GPU_HYBRID`): entropy decoding runs on the GPU instead of
-//! the CPU (the default `nvjpegCreateSimple` backend decodes entropy on the
-//! CPU, competing with the rayon workers), and it is the backend that
-//! accepts decode output in device memory. The nvJPEG hardware decoder
-//! (`NVJPEG_BACKEND_HARDWARE`) is not reachable through `nvjpegCreateEx` on
-//! current drivers, and `nvjpegDecodeBatched` only uses the GPU for batches
-//! of 50+ images — neither is usable here, so decode is per-image on
-//! per-slot streams.
+//! The handle uses the GPU-hybrid backend (`NVJPEG_BACKEND_GPU_HYBRID`,
+//! entropy decode on the GPU), created via `nvjpegCreateEx` because the V1
+//! `nvjpegCreate` rejects it on current drivers — see the measured
+//! same-session A/B at the creation site. The nvJPEG hardware decoder
+//! (`NVJPEG_BACKEND_HARDWARE`) is not reachable through `nvjpegCreateEx` or
+//! `nvjpegDecoderCreate` on current drivers, and
+//! `nvjpegDecodeBatchedInitialize` returns `NVJPEG_STATUS_BAD_PARAMETER` on
+//! every backend and batch size here — neither is usable, so decode is
+//! per-image on per-slot streams.
 //!
 //! `/DeviceGray` streams never reach the GPU — nvJPEG has no single-channel
 //! input format, so the CPU backend encodes them (which also keeps the
@@ -368,20 +368,25 @@ impl GpuState {
             .map_err(|e| TranscodeError::Unavailable(format!("nvJPEG library: {e}")))?;
 
         unsafe {
-            // GPU-hybrid backend: entropy decode on the GPU too (the
-            // default `nvjpegCreateSimple` decodes entropy on the CPU,
-            // competing with the rayon workers), and the backend that
-            // accepts decode output in device memory. Falls back to the
-            // default backend on older nvJPEG builds that predate it.
+            // GPU-hybrid backend via `nvjpegCreateEx` — the V1 `nvjpegCreate`
+            // rejects this backend with `NVJPEG_STATUS_BAD_PARAMETER` on
+            // current drivers (CUDA 13.x). Same-session A/B on an RTX 4080
+            // SUPER shows no significant difference from the default backend
+            // (photos20 0.285 vs 0.289 s, photos60 0.476 vs 0.465 s, mixed
+            // 0.374 vs 0.366 s), so the documented device-output backend is
+            // used; the default (`nvjpegCreateSimple`) is the fallback on
+            // older nvJPEG builds.
             let mut handle = ptr::null_mut();
-            let backend_ok = if let Ok(pfn) = lib.nvjpeg_create() {
+            let backend_ok = if let Ok(pfn) = lib.nvjpeg_create_ex() {
                 check(pfn(
                     nvjpeg::nvjpegBackend_t::GpuHybrid,
                     ptr::null_mut(),
                     ptr::null_mut(),
+                    0,
                     &mut handle,
                 ))
                 .is_ok()
+                    && !handle.is_null()
             } else {
                 false
             };
