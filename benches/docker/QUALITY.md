@@ -465,9 +465,14 @@ the source, `pareto.py --optimize`, same corpus):
   because replacing the paper texture costs render fidelity; the
   ≤0.98 frontier belongs to the bitonal masks (`--jbig2` 1.3 KB and
   `smallest` 1.1 KB, both at SSIM 0.981 — the texture is gone, which is
-  what "flat" means). The composite thus occupies the region commercial
-  MRC engines aim at: visually lossless scan compression at a tiny
-  fraction of the full-res tools' sizes.
+  what "flat" means). On this synthetic grainy-scan fixture, flat MRC
+  reaches 2.3 KB at 0.9997 300-dpi render SSIM — roughly two orders of
+  magnitude smaller than the measured full-raster alternatives at
+  comparable render fidelity. That is a *render-fidelity* claim: the
+  underlying image information is not equivalent (the 0.9999 court
+  exposes the missing native paper texture), which is exactly the region
+  commercial MRC engines aim at — and the residual their texture-aware
+  variants attack.
 - **image-heavy.pdf — the codec candidates are honest, not Pareto-new.**
   `--jpeg2000` wins the per-image size court on the photos (1.38 MB vs
   1.51 MB at q50) but at render SSIM 0.9931 vs 0.9995 — the runtime
