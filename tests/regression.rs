@@ -3072,6 +3072,424 @@ fn mrc_composite_is_opaque_over_colored_background() {
     );
 }
 
+/// The mask-fidelity gate: the classifier must *measure* that the bitonal
+/// reconstruction fits the source luma, not just trust its heuristics. A
+/// page that is mostly white/black — so every heuristic rule (near-white +
+/// near-black ≥ 0.6, neutral, glyph-sized components) passes — but contains
+/// a smooth continuous-tone region must NOT be masked: the mask would
+/// discard the region's grayscale variation. Measured on the corpus: clean
+/// grainy scans score ≈ 4.0, this fixture ≈ 15, photographs ≈ 21.
+#[test]
+#[cfg(feature = "optimize")]
+fn classifier_gate_rejects_continuous_tone_on_paper() {
+    use presse::pdf::classify::{RasterClass, classify as classify_raster};
+
+    let (w, h) = (800u32, 600u32);
+    let mut clean = vec![255u8; (w * h * 3) as usize];
+    for y in 0..h {
+        if y % 17 == 0 {
+            for x in 0..w {
+                let p = ((y * w + x) * 3) as usize;
+                clean[p..p + 3].copy_from_slice(&[24, 24, 24]);
+            }
+        }
+    }
+    let d = classify_raster(&clean, w, h);
+    assert_eq!(
+        d.class,
+        RasterClass::BitonalText,
+        "clean black-on-white text must stay bitonal"
+    );
+    assert!(d.mask.is_some(), "bitonal ⇒ a full-resolution mask");
+
+    // Same text plus a 400×300 smooth 60→200 luma gradient: the heuristic
+    // rules all pass (near-white+near-black ≈ 0.75, fully neutral, the text
+    // keeps glyph-sized components) but the bitonal reconstruction error is
+    // ≈ 15 > 10 — the gate must reject it.
+    let mut mixed = clean.clone();
+    for yy in 0..300u32 {
+        let v = 60u32 + (200 - 60) * yy / 300;
+        for xx in 200..600u32 {
+            let p = ((yy * w + xx) * 3) as usize;
+            mixed[p..p + 3].copy_from_slice(&[v as u8, v as u8, v as u8]);
+        }
+    }
+    let d2 = classify_raster(&mixed, w, h);
+    assert_ne!(
+        d2.class,
+        RasterClass::BitonalText,
+        "a continuous-tone region on paper must not be masked"
+    );
+    assert!(d2.mask.is_none(), "rejected bitonal ⇒ no mask");
+}
+
+/// Render the first page at an explicit resolution (the shared helper is 72
+/// dpi; the transform regressions need 300 dpi ink-location precision).
+fn render_first_page_at(pdf: &Path, prefix: &Path, dpi: &str) -> bool {
+    let output = Command::new("pdftoppm")
+        .args(["-singlefile", "-png", "-r", dpi, "-f", "1", "-l", "1"])
+        .arg(pdf)
+        .arg(prefix)
+        .output();
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// The brutal transform regression for `--mrc`: the foreground must land
+/// *exactly* under the source raster when the placement is a general affine
+/// transform (scale + rotation + shear + translation), not axis-aligned
+/// scaling. A rewrite that re-applied the placement `cm` — or otherwise
+/// disturbed the inherited CTM — would displace the ink entirely; this test
+/// compares exact ink locations (300 dpi) between the source render and the
+/// MRC render. The pattern is deliberately asymmetric so any shift shows up
+/// in the ink bounding box, not just in a soft SSIM average.
+#[test]
+#[cfg(feature = "optimize")]
+fn mrc_foreground_lands_exactly_under_affine_transform() {
+    let dir = test_dir();
+    if !ensure_tool("pdftoppm", pdftoppm_available()) {
+        return;
+    }
+    let (w, h) = (900u32, 700u32);
+    let mut px = vec![240u8; (w * h * 3) as usize];
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let ink =
+                y % 13 == 0 || (x > 500 && y < 300 && (x - 500) % 7 == 0) || (x + y) % 61 == 0;
+            let v = if ink {
+                18u8
+            } else {
+                240u8.wrapping_sub((next() & 0x0f) as u8)
+            };
+            let p = ((y * w + x) * 3) as usize;
+            px[p..p + 3].copy_from_slice(&[v, v, v]);
+        }
+    }
+
+    // Placement: scale 500×380, rotation ≈ 8°, explicit shear, translation
+    // (60, 210) — a full-rank affine matrix.
+    let (m0, m1, m2, m3, m4, m5) = (495.0, 69.5, 30.0, 376.0, 60.0, 210.0);
+
+    // `raw` = the untouched source (the ground truth for where the ink
+    // lands); `post` = the MRC output. The compressed-but-maskless "pre"
+    // is deliberately not used as the baseline: its JPEG re-encode blurs
+    // the rotated edges, muddying the ink-location comparison.
+    let build = |dir: &Path, name: &str, raw: bool, mrc: bool| {
+        let (mut doc, pages_id) = new_doc();
+        let mut image_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "BitsPerComponent" => 8,
+        };
+        image_dict.set("ColorSpace", "DeviceRGB");
+        let mut image_stream = Stream::new(image_dict, px.clone());
+        image_stream.compress().unwrap();
+        let image_id = doc.add_object(image_stream);
+        let content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![
+                        m0.into(),
+                        m1.into(),
+                        m2.into(),
+                        m3.into(),
+                        m4.into(),
+                        m5.into(),
+                    ],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+        });
+        push_kid(&mut doc, pages_id, page_id);
+        if !raw {
+            compress_images_opt(
+                &mut doc,
+                QualityMode::fixed(QUALITY),
+                false,
+                &CpuTranscoder::default(),
+                CompressOptions {
+                    mrc,
+                    ..CompressOptions::default()
+                },
+            );
+        }
+        save_pdf(&mut doc, dir.join(name).to_str().unwrap()).unwrap();
+    };
+
+    build(&dir, "affine-raw.pdf", true, false);
+    build(&dir, "affine-post.pdf", false, true);
+    assert!(
+        render_first_page_at(&dir.join("affine-raw.pdf"), &dir.join("affine-raw"), "300"),
+        "pdftoppm failed on affine-raw.pdf"
+    );
+    assert!(
+        render_first_page_at(
+            &dir.join("affine-post.pdf"),
+            &dir.join("affine-post"),
+            "300"
+        ),
+        "pdftoppm failed on affine-post.pdf"
+    );
+
+    let ink = |img: &GrayImage| {
+        let mut bbox = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        let mut n = 0u64;
+        for (x, y, p) in img.enumerate_pixels() {
+            if p[0] < 128 {
+                n += 1;
+                bbox.0 = bbox.0.min(x as i64);
+                bbox.1 = bbox.1.min(y as i64);
+                bbox.2 = bbox.2.max(x as i64);
+                bbox.3 = bbox.3.max(y as i64);
+            }
+        }
+        (n, bbox)
+    };
+    let raw = image::open(dir.join("affine-raw.png")).unwrap().to_luma8();
+    let post = image::open(dir.join("affine-post.png")).unwrap().to_luma8();
+    assert_eq!(raw.dimensions(), post.dimensions());
+    let (raw_n, raw_box) = ink(&raw);
+    let (_, post_box) = ink(&post);
+    assert!(raw_n > 0, "the source render must contain ink");
+    // ±2 px on each side: the source went through the JPEG candidate and
+    // the rotated edges anti-alias, so a one-pixel fringe is expected — a
+    // misplaced foreground (the double-`cm` bug) shifts the box by
+    // hundreds of pixels instead.
+    for (a, b, axis) in [
+        (raw_box.0, post_box.0, "min x"),
+        (raw_box.1, post_box.1, "min y"),
+        (raw_box.2, post_box.2, "max x"),
+        (raw_box.3, post_box.3, "max y"),
+    ] {
+        assert!(
+            (a - b).abs() <= 2,
+            "the MRC ink must occupy exactly the source ink's bounding box \
+             ({axis}: {a} vs {b})"
+        );
+    }
+    // Jaccard over ink pixels: the mask is the exact Otsu split, so the
+    // overlap must be near-total (anti-aliased edges are the only slack).
+    let (mut inter, mut union) = (0u64, 0u64);
+    for (a, b) in raw.pixels().zip(post.pixels()) {
+        let (ia, ib) = (a[0] < 128, b[0] < 128);
+        if ia && ib {
+            inter += 1;
+        }
+        if ia || ib {
+            union += 1;
+        }
+    }
+    let jaccard = inter as f64 / union as f64;
+    assert!(
+        jaccard >= 0.97,
+        "the MRC ink must land on the source ink pixels (Jaccard {jaccard:.4})"
+    );
+}
+
+/// MRC inside a self-contained Form XObject: the foreground resource must be
+/// registered in the *form's* `/Resources` (a Form is a stream whose own
+/// dict resolves its content names — not a page dictionary), and the form's
+/// content must gain the foreground draw. Without this, renderers resolve
+/// `/FgMrc0 Do` against a form that never declares it and the foreground
+/// silently vanishes.
+#[test]
+#[cfg(feature = "optimize")]
+fn mrc_inside_self_contained_form_registers_foreground() {
+    let dir = test_dir();
+    if !ensure_tool("pdftoppm", pdftoppm_available()) {
+        return;
+    }
+    let (w, h) = (800u32, 600u32);
+    let mut text = vec![240u8; (w * h * 3) as usize];
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let v = if y % 17 == 0 {
+                24
+            } else {
+                240u8.wrapping_sub((next() & 0x0f) as u8)
+            };
+            let p = ((y * w + x) * 3) as usize;
+            text[p..p + 3].copy_from_slice(&[v, v, v]);
+        }
+    }
+
+    let build = |dir: &Path, name: &str, mrc: bool| {
+        let (mut doc, pages_id) = new_doc();
+        let mut image_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "BitsPerComponent" => 8,
+        };
+        image_dict.set("ColorSpace", "DeviceRGB");
+        let mut image_stream = Stream::new(image_dict, text.clone());
+        image_stream.compress().unwrap();
+        let image_id = doc.add_object(image_stream);
+
+        // Self-contained form: own /Resources, content draws the image in
+        // form space. The form's BBox is the page rect and the page draws
+        // the form at the identity transform, so the form content's `cm`
+        // maps image units straight onto page points — the page must *not*
+        // add its own 612×792 `cm` (that would multiply the form's `cm`
+        // onto itself, the exact double-`cm` trap the MRC rewrite avoids).
+        let form_content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![
+                        600.into(),
+                        0.into(),
+                        0.into(),
+                        450.into(),
+                        6.into(),
+                        170.into(),
+                    ],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        }
+        .encode()
+        .unwrap();
+        let form_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+            },
+            form_content,
+        )));
+
+        // Page draws the form at the identity transform.
+        let page_content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new("Do", vec![Object::Name(b"Fm0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        }
+        .encode()
+        .unwrap();
+        let page_content_id =
+            doc.add_object(Object::Stream(Stream::new(dictionary! {}, page_content)));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => page_content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Fm0" => form_id } },
+        });
+        push_kid(&mut doc, pages_id, page_id);
+        compress_images_opt(
+            &mut doc,
+            QualityMode::fixed(QUALITY),
+            false,
+            &CpuTranscoder::default(),
+            CompressOptions {
+                mrc,
+                ..CompressOptions::default()
+            },
+        );
+        save_pdf(&mut doc, dir.join(name).to_str().unwrap()).unwrap();
+    };
+
+    build(&dir, "form-pre.pdf", false);
+    build(&dir, "form-post.pdf", true);
+    let loaded = assert_well_formed(&dir.join("form-post.pdf"));
+
+    // The form (a stream) must now own the foreground: its /Resources gains
+    // FgMrc0 pointing at an image with an /SMask, and its content draws it.
+    let mut form = None;
+    for obj in loaded.objects.values() {
+        if let Object::Stream(s) = obj
+            && s.dict.get(b"Subtype").ok().and_then(|t| t.as_name().ok())
+                == Some(b"Form".as_slice())
+        {
+            form = Some(s);
+        }
+    }
+    let form = form.expect("the output must still contain the Form XObject");
+    let xobjects = form
+        .dict
+        .get(b"Resources")
+        .ok()
+        .and_then(|r| r.as_dict().ok())
+        .and_then(|r| r.get(b"XObject").ok())
+        .and_then(|x| x.as_dict().ok());
+    let xobjects = xobjects.expect("the form's resources must declare XObjects");
+    let fg_ref = xobjects
+        .get(b"FgMrc0")
+        .expect("the foreground must be registered in the *form's* resources")
+        .as_reference()
+        .ok();
+    let fg_ref = fg_ref.expect("FgMrc0 must be an indirect reference");
+    let Object::Stream(fg) = loaded.objects.get(&fg_ref).unwrap() else {
+        panic!("FgMrc0 must be a stream");
+    };
+    assert!(
+        fg.dict.get(b"SMask").is_ok(),
+        "the registered foreground must be the masked ink layer"
+    );
+    let form_content = form
+        .decompressed_content()
+        .expect("the form content must stay parseable");
+    assert!(
+        form_content.windows(6).any(|w| w == b"FgMrc0"),
+        "the form content must draw the foreground layer"
+    );
+
+    // And the composite must render with the ink in exactly the source's
+    // location (the whole point of registering it in the form's resources).
+    assert!(
+        render_first_page_at(&dir.join("form-pre.pdf"), &dir.join("form-pre"), "300"),
+        "pdftoppm failed on form-pre.pdf"
+    );
+    assert!(
+        render_first_page_at(&dir.join("form-post.pdf"), &dir.join("form-post"), "300"),
+        "pdftoppm failed on form-post.pdf"
+    );
+    let pre = image::open(dir.join("form-pre.png")).unwrap().to_luma8();
+    let post = image::open(dir.join("form-post.png")).unwrap().to_luma8();
+    let ink_of = |img: &GrayImage| -> u64 { img.pixels().filter(|p| p[0] < 128).count() as u64 };
+    assert!(ink_of(&pre) > 0, "the source render must contain ink");
+    let diff = ink_of(&post) as i64 - ink_of(&pre) as i64;
+    let ratio = ink_of(&post) as f64 / ink_of(&pre) as f64;
+    assert!(
+        (0.90..=1.10).contains(&ratio),
+        "the form-composited ink must match the source ink coverage \
+         ({diff:+} px, ratio {ratio:.3})"
+    );
+}
+
 /// `--jpeg2000`: the JPXDecode candidate (a minimal JP2 file) must decode in
 /// poppler and mutool and stay visually equivalent to the source.
 #[test]

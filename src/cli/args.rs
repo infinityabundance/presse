@@ -202,16 +202,18 @@ Default (flag omitted): JPEG-only pipeline, current behavior."
         )]
         zopfli: bool,
 
-        /// Subset embedded TrueType/CFF fonts to the glyphs actually used.
+        /// Subset embedded TrueType fonts to the glyphs actually used.
         #[arg(
             long,
             default_value_t = false,
-            long_help = "Subset every embedded TrueType/CFF font to the glyphs the content
+            long_help = "Subset every embedded TrueType font to the glyphs the content
   streams actually use (typst's `subsetter`): text-showing operators are
   scanned per font, used glyphs are kept, and the font is rewritten as a
   CID font with an identity GID-to-CID map so the content strings are
   remapped in place. A font is skipped whenever the used-glyph mapping
-  cannot be resolved exactly (unusual encodings, Type1/CID fonts), and the
+  cannot be resolved exactly (unusual encodings, Type1/CID fonts) or the
+  program is CFF (FontFile3 — CFF subsetting is not implemented; only
+  TrueType FontFile2 programs are subset), and the
   subset is kept only when strictly smaller. Text extraction stays valid
   via a rebuilt ToUnicode map. Requires a build with the `optimize`
   feature."

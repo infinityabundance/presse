@@ -42,10 +42,12 @@ All notable changes to this project will be documented in this file.
   `--compression {fast,balanced,small,smallest}` presets that expand to
   `--dedup`, `--zopfli`, `--font-subset`, `--jbig2`, `--jpeg2000` and
   `--mrc`. Every pass follows the image pipeline's discipline — applied
-  only when strictly smaller (or provably rendering-equivalent *and*
-  smaller), lossless where claimed, a no-op on anything it cannot prove
-  safe. The flags fail with an explicit build hint when the feature is
-  absent.
+  only when strictly smaller *and* within its measured fidelity budget
+  (lossless structural rewrites by construction; lossy candidates gated
+  on per-image measurement — palette ≥0.9999 native SSIM, bitonal masks
+  on the classifier's reconstruction-error gate), a no-op whenever a
+  conservative gate rejects it. The flags fail with an explicit build hint
+  when the feature is absent.
 - **`--dedup`** (`optimize` feature, off by default) — the duplicate-image
   coalescer extended to every stream: byte-identical FontFile programs,
   ICC profiles, XForms, patterns and arbitrary streams collapse onto one
@@ -56,11 +58,12 @@ All notable changes to this project will be documented in this file.
   level-9 zlib: a few percent smaller on text/content streams, kept only
   when strictly smaller.
 - **`--font-subset`** (`optimize` feature, off by default) — embedded
-  TrueType/CFF fonts are subset to the glyphs the content streams actually
+  TrueType fonts are subset to the glyphs the content streams actually
   show (typst's `subsetter`) and rewritten as CID fonts (`/Identity-H` +
   identity `CIDToGIDMap`) with the text strings remapped in place and a
   rebuilt `/ToUnicode`; fonts whose used-glyph mapping cannot be resolved
-  exactly are skipped, and the subset is kept only when strictly smaller
+  exactly are skipped, CFF (`FontFile3`) programs are not subset, and the
+  subset is kept only when strictly smaller
   (194 KB TrueType font-heavy PDF → ~7 KB, pixel-identical rendering,
   text extraction intact).
 - **`--jbig2`** (`optimize` feature, off by default) — a lossless JBIG2

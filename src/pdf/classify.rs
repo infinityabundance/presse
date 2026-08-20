@@ -20,7 +20,11 @@
 //! The decision is deliberately conservative: an image is `BitonalText`
 //! only when it is *mostly* black-and-white with glyph-sized components —
 //! a photograph or a colored figure is never masked, because the mask
-//! representation drops color and anti-aliasing. The routing is:
+//! representation drops color and anti-aliasing. The heuristic rules are
+//! backed by one *measured* gate: the bitonal reconstruction (each pixel
+//! replaced by its class mean) must fit the source luma within a small
+//! mean error, so the RGB→bitonal conversion is verified per image rather
+//! than assumed safe (see [`reconstruction_error`]). The routing is:
 //!
 //! ```text
 //! BitonalText   -> 1-bit CCITT G4 opaque DeviceGray image
@@ -73,6 +77,52 @@ const MIN_COMPONENTS: usize = 20;
 const MAX_LARGEST_FRACTION: f64 = 0.3;
 /// Median glyph area above this is not text at the sample scale.
 const MAX_MEDIAN_AREA: u32 = 256;
+/// Maximum mean luma error of the bitonal reconstruction (each pixel
+/// replaced by its class mean) before an image is *not* bitonal. Measured
+/// on the corpus: a clean grainy scan scores ≈ 4.0 (paper grain dominates),
+/// a photograph the heuristic rules would otherwise accept scores ≈ 21 —
+/// the gate separates them with a wide margin.
+const MAX_RECON_MEAN_ERR: f64 = 10.0;
+
+/// Mean absolute difference between the sampled luma and its bitonal
+/// reconstruction — every pixel replaced by the mean of its own class
+/// (ink ≤ threshold, paper > threshold). This *measures* the variation the
+/// RGB→bitonal conversion would discard: a genuine bitonal scan has tiny
+/// in-class variance (the Otsu split is clean, only anti-aliased glyph
+/// edges deviate), while a photograph or gradient that the heuristic rules
+/// happened to pass still fails here. The mask candidates (G4, JBIG2, MRC)
+/// are gated on this, turning "the classifier is conservative" into a
+/// per-image measurement.
+pub fn reconstruction_error(luma: &[u8], mask: &[u8]) -> f64 {
+    let n = luma.len() as f64;
+    if n == 0.0 {
+        return f64::MAX;
+    }
+    let (mut sum_ink, mut n_ink, mut sum_paper, mut n_paper) = (0u64, 0u64, 0u64, 0u64);
+    for (&v, &m) in luma.iter().zip(mask) {
+        if m == 1 {
+            sum_ink += v as u64;
+            n_ink += 1;
+        } else {
+            sum_paper += v as u64;
+            n_paper += 1;
+        }
+    }
+    if n_ink == 0 || n_paper == 0 {
+        return f64::MAX;
+    }
+    let mean_ink = sum_ink as f64 / n_ink as f64;
+    let mean_paper = sum_paper as f64 / n_paper as f64;
+    let err: f64 = luma
+        .iter()
+        .zip(mask)
+        .map(|(&v, &m)| {
+            let mean = if m == 1 { mean_ink } else { mean_paper };
+            (v as f64 - mean).abs()
+        })
+        .sum();
+    err / n
+}
 
 /// Classify an RGB raster. `rgb` is `width × height × 3` interleaved bytes.
 pub fn classify(rgb: &[u8], width: u32, height: u32) -> Classification {
@@ -119,16 +169,20 @@ pub fn classify(rgb: &[u8], width: u32, height: u32) -> Classification {
     // Adaptive (Otsu) threshold on the sample, then component analysis.
     let thr = otsu_threshold(&luma);
     let mask_sample: Vec<u8> = luma.iter().map(|&v| u8::from(v <= thr)).collect();
+    let recon_err = reconstruction_error(&luma, &mask_sample);
     let areas = connected_components(&mask_sample, sw as usize, sh as usize);
     let ink_frac = areas.iter().sum::<u32>() as f64 / n;
     let (components, median_area, largest_frac) = component_stats(&areas, n);
 
-    // Conservative rules — see the module doc for why.
+    // Conservative rules — see the module doc for why. The reconstruction
+    // error is the measured gate: it rejects content whose grayscale
+    // variation the mask would actually discard.
     let bitonal = (0.001..=0.7).contains(&ink_frac)
         && near_white_frac + near_black_frac >= 0.6
         && neutral_frac >= 0.85
         && components >= MIN_COMPONENTS
-        && (median_area <= MAX_MEDIAN_AREA || largest_frac <= MAX_LARGEST_FRACTION);
+        && (median_area <= MAX_MEDIAN_AREA || largest_frac <= MAX_LARGEST_FRACTION)
+        && recon_err <= MAX_RECON_MEAN_ERR;
 
     let class = if bitonal {
         RasterClass::BitonalText
@@ -142,7 +196,11 @@ pub fn classify(rgb: &[u8], width: u32, height: u32) -> Classification {
 
     let mask = if bitonal {
         // Full-resolution mask from the full-resolution luma: one pass.
-        let mut full = Vec::with_capacity(((width * height) as usize).div_ceil(8));
+        // Rows are packed to whole bytes (each row's partial byte is
+        // pushed at the row end), matching the `encode_g4` / `jbig2_encode`
+        // / `mrc_layers` contract — a flat pack would only agree with them
+        // when the width is a multiple of 8.
+        let mut full = Vec::with_capacity((width as usize).div_ceil(8) * height as usize);
         let mut acc = 0u8;
         let mut nbits = 0u8;
         let mut p = 0usize;
@@ -158,9 +216,11 @@ pub fn classify(rgb: &[u8], width: u32, height: u32) -> Classification {
                     nbits = 0;
                 }
             }
-        }
-        if nbits > 0 {
-            full.push(acc << (8 - nbits));
+            if nbits > 0 {
+                full.push(acc << (8 - nbits));
+                acc = 0;
+                nbits = 0;
+            }
         }
         Some(full)
     } else {
@@ -203,6 +263,7 @@ pub fn classify_gray(gray: &[u8], width: u32, height: u32) -> Classification {
     let n = (sw * sh) as f64;
     let thr = otsu_threshold(&luma);
     let mask_sample: Vec<u8> = luma.iter().map(|&v| u8::from(v <= thr)).collect();
+    let recon_err = reconstruction_error(&luma, &mask_sample);
     let areas = connected_components(&mask_sample, sw as usize, sh as usize);
     let ink_frac = areas.iter().sum::<u32>() as f64 / n;
     let (components, median_area, largest_frac) = component_stats(&areas, n);
@@ -210,7 +271,8 @@ pub fn classify_gray(gray: &[u8], width: u32, height: u32) -> Classification {
     let bitonal = (0.001..=0.7).contains(&ink_frac)
         && near_white as f64 / n + near_black as f64 / n >= 0.6
         && components >= MIN_COMPONENTS
-        && (median_area <= MAX_MEDIAN_AREA || largest_frac <= MAX_LARGEST_FRACTION);
+        && (median_area <= MAX_MEDIAN_AREA || largest_frac <= MAX_LARGEST_FRACTION)
+        && recon_err <= MAX_RECON_MEAN_ERR;
 
     let class = if bitonal {
         RasterClass::BitonalText
@@ -223,20 +285,26 @@ pub fn classify_gray(gray: &[u8], width: u32, height: u32) -> Classification {
     };
 
     let mask = if bitonal {
-        let mut full = Vec::with_capacity(((width * height) as usize).div_ceil(8));
-        let mut acc = 0u8;
-        let mut nbits = 0u8;
-        for &v in gray {
-            acc = (acc << 1) | u8::from(v <= thr);
-            nbits += 1;
-            if nbits == 8 {
-                full.push(acc);
-                acc = 0;
-                nbits = 0;
+        // Row-packed like `classify` (see there): each row's partial byte
+        // is pushed at the row end, matching the G4/JBIG2/MRC consumers.
+        let row_bytes = (width as usize).div_ceil(8);
+        let mut full = Vec::with_capacity(row_bytes * height as usize);
+        for row in 0..height as usize {
+            let base = row * width as usize;
+            let mut acc = 0u8;
+            let mut nbits = 0u8;
+            for x in 0..width as usize {
+                acc = (acc << 1) | u8::from(gray[base + x] <= thr);
+                nbits += 1;
+                if nbits == 8 {
+                    full.push(acc);
+                    acc = 0;
+                    nbits = 0;
+                }
             }
-        }
-        if nbits > 0 {
-            full.push(acc << (8 - nbits));
+            if nbits > 0 {
+                full.push(acc << (8 - nbits));
+            }
         }
         Some(full)
     } else {

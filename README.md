@@ -135,7 +135,7 @@ presse merge *.png *.pdf
 | `-c, --compression` | `fast` | Effort preset that enables the default-off flags together: `fast` (JPEG-only), `balanced` (+ `--dedup`), `small` (+ `--zopfli`, `--recompress-flate`), `smallest` (+ `--jbig2`, `--jpeg2000`, `--font-subset`, `--mrc` and every structural pass). Individual flags still work on their own; modes other than `fast` require the `optimize` feature build |
 | `--dedup` | `false` | Coalesce byte-identical non-image streams (fonts, ICC profiles, XForms, patterns, arbitrary streams) onto one canonical object, rewriting every reference — the duplicate-image pattern extended to the whole document. Lossless; requires the `optimize` feature |
 | `--zopfli` | `false` | Like `--recompress-flate`, but the re-encode uses the Zopfli deflate search — deliberately CPU-hungry, routinely a few % smaller than level-9 zlib on text/content streams. Strictly-smaller gate; pure size win at CPU cost; requires the `optimize` feature |
-| `--font-subset` | `false` | Subset every embedded TrueType/CFF font to the glyphs the content streams actually show (typst's `subsetter`), rewritten as a CID font with a rebuilt `ToUnicode`. Fonts are skipped unless the used-glyph mapping resolves exactly and the subset is strictly smaller; requires the `optimize` feature |
+| `--font-subset` | `false` | Subset every embedded TrueType font to the glyphs the content streams actually show (typst's `subsetter`), rewritten as a CID font with a rebuilt `ToUnicode`. Fonts are skipped unless the used-glyph mapping resolves exactly (CFF `FontFile3` programs are not subset) and the subset is strictly smaller; requires the `optimize` feature |
 | `--jbig2` | `false` | Add a lossless JBIG2 (symbol-dictionary) candidate for bitonal content alongside the CCITT G4 one — repeated glyph shapes share one dictionary entry; the size court keeps the smaller of G4 / JBIG2 / original per image; requires the `optimize` feature |
 | `--jpeg2000` | `false` | Add a JPEG2000 (JPXDecode, minimal JP2 file) candidate for continuous-tone images, rate-targeted at 85% of the JPEG candidate's byte budget so the court prefers it only when genuinely smaller at comparable rate; requires the `optimize` feature |
 | `--mrc` | `false` | Build a real mixed-raster composite for classified bitonal scans — a solid paper-color background (median paper color, emitted as a 1×1 image), solid ink-color foreground composited through a high-resolution lossless CCITT G4 mask as its `/SMask`, content rewritten to draw background then foreground (the ABBYY/LEADTOOLS/Pdftools representation); requires the `optimize` feature |
@@ -253,11 +253,16 @@ the flag today.
 The heavyweight candidates live behind the `optimize` Cargo feature
 (`cargo install --features optimize` or `cargo build --release --features
 optimize`) and default-off CLI flags. Each pass follows the same
+
 discipline as the image pipeline: a representation is applied only when it
-is *strictly smaller* (or provably rendering-equivalent *and* smaller), is
-lossless where claimed, and degrades to a no-op on anything it cannot
-prove safe. The flags are independent and compose; `--compression`
-presets expand to them:
+is *strictly smaller* **and** within its measured fidelity budget — the
+lossless structural rewrites (`--dedup`, `--zopfli`, `--recompress-flate`,
+font subsetting) are safe by construction, while the lossy candidates are
+gated on a per-image measurement (palette on ≥0.9999 native SSIM, the
+bitonal masks on the classifier's reconstruction-error gate, JPEG2000 on
+its rate target plus the fixture-level oracle) — and degrades to a no-op
+whenever a conservative gate rejects it. The flags are independent and
+compose; `--compression` presets expand to them:
 
 - **`--dedup`** — the duplicate-image coalescer extended to every stream:
   byte-identical FontFile programs, ICC profiles, XForms, patterns and
@@ -267,13 +272,15 @@ presets expand to them:
 - **`--zopfli`** — the `--recompress-flate` pass with the Zopfli deflate
   search instead of level-9 zlib: same decoded bytes, a few percent
   smaller on text/content streams, kept only when strictly smaller.
-- **`--font-subset`** — embedded TrueType/CFF fonts are subset to the
+- **`--font-subset`** — embedded TrueType fonts are subset to the
   glyphs the content streams actually show (typst's `subsetter`) and
   rewritten as CID fonts (`/Identity-H` + identity `CIDToGIDMap`) with the
   text strings remapped in place and a rebuilt `/ToUnicode`, so rendering
   and text extraction are unchanged. A font is skipped whenever the
   used-glyph mapping cannot be resolved exactly (unusual encodings,
-  resource-less forms, unparseable streams) and the subset is kept only
+  resource-less forms, unparseable streams) or the program is CFF
+  (`FontFile3` — CFF subsetting is not implemented, only TrueType
+  `FontFile2` programs are subset), and the subset is kept only
   when strictly smaller. A font-heavy PDF (194 KB with a full TrueType
   program) becomes ~7 KB with pixel-identical rendering.
 - **`--jbig2`** — a lossless JBIG2 candidate (Rust `jbig2enc-rust`,

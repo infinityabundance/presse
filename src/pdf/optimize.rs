@@ -288,8 +288,6 @@ struct FontPlan {
     old_ids: Vec<ObjectId>,
     /// Original descriptor dict (reused, with the new font program).
     descriptor: Option<lopdf::Dictionary>,
-    /// `FontFile2` (TrueType) or `FontFile3` (CFF).
-    file_key: Vec<u8>,
 }
 
 /// Scan one content stream for text-showing ops. `inherits` is true when
@@ -516,21 +514,19 @@ fn build_font_plan(doc: &Document, font_id: ObjectId, usage: &FontUsage) -> Opti
     }
     let desc_id = font.get(b"FontDescriptor").ok()?.as_reference().ok()?;
     let descriptor = doc.get_object(desc_id).ok()?.as_dict().ok()?.clone();
-    let file_key: Vec<u8>;
-    let file_id: ObjectId;
-    if let Ok(f) = descriptor.get(b"FontFile2") {
-        file_key = b"FontFile2".to_vec();
-        file_id = f.as_reference().ok()?;
-    } else if let Ok(f) = descriptor.get(b"FontFile3") {
-        let sub = f.as_dict().ok()?.get(b"Subtype").ok()?.as_name().ok()?;
-        if sub != b"Type1C" {
-            return None; // OpenType/CFF2 programs are not supported
-        }
-        file_key = b"FontFile3".to_vec();
-        file_id = f.as_reference().ok()?;
+    // Only TrueType programs (FontFile2) are subset. A CFF program
+    // (FontFile3 — the descriptor value is an indirect reference to the
+    // program stream; its `/Subtype`, `Type1C` or `CIDFontType0C`, lives on
+    // that stream's dict) is deliberately skipped: the installer below
+    // emits the TrueType path (a `CIDFontType2` descendant + identity
+    // `CIDToGIDMap`), and a CFF subset needs a `CIDFontType0` descendant
+    // with its own charset and width handling, so claiming CFF support
+    // would mis-install it.
+    let file_id: ObjectId = if let Ok(f) = descriptor.get(b"FontFile2") {
+        f.as_reference().ok()?
     } else {
         return None;
-    }
+    };
     let Object::Stream(file_stream) = doc.get_object(file_id).ok()? else {
         return None;
     };
@@ -670,7 +666,6 @@ fn build_font_plan(doc: &Document, font_id: ObjectId, usage: &FontUsage) -> Opti
         font_file: subset_bytes,
         old_ids,
         descriptor: Some(descriptor),
-        file_key,
     })
 }
 
@@ -782,21 +777,18 @@ fn install_font_plan(doc: &mut Document, plan: &FontPlan) -> bool {
         .unwrap_or(b"Font");
 
     // Font program stream.
-    let mut file = Stream::new(
+    let file = Stream::new(
         dictionary! {
             "Length" => plan.font_file.len() as i64,
         },
         plan.font_file.clone(),
     );
-    if plan.file_key == b"FontFile3" {
-        file.dict.set(b"Subtype", Object::Name(b"Type1C".to_vec()));
-    }
     let file_id = doc.add_object(Object::Stream(file));
 
     // Descriptor (reuses the original dict, new program + name).
     let mut descriptor = plan.descriptor.clone().unwrap_or_default();
     descriptor.set(b"FontName", Object::Name(plan.base_font.clone()));
-    descriptor.set(plan.file_key.as_slice(), Object::Reference(file_id));
+    descriptor.set(b"FontFile2", Object::Reference(file_id));
     let desc_id = doc.add_object(Object::Dictionary(descriptor));
 
     // CIDFontType2 descendant.
@@ -1929,10 +1921,12 @@ pub(crate) fn apply_mrc_rewrites(doc: &mut Document, sites: &[MrcSite], fg_objec
             // Register the foreground XObject in the *owner's* resources —
             // the page or form object whose dictionary resolves the stream's
             // names (renderers resolve page content through the page's
-            // `/Resources`, not the content stream's own). The scan recorded
-            // the effective dictionary so every name the stream already
-            // resolves is preserved, and every distinct owner of a shared
-            // stream gets the entry.
+            // `/Resources`, and a form's content through the form stream's
+            // own `/Resources`). Pages are dictionaries; a self-contained
+            // Form XObject is a stream, so both shapes are handled. The scan
+            // recorded the effective dictionary so every name the stream
+            // already resolves is preserved, and every distinct owner of a
+            // shared stream gets the entry.
             let mut owners: Vec<ObjectId> = Vec::new();
             for site in &stream_sites {
                 if !owners.contains(&site.owner) {
@@ -1941,10 +1935,15 @@ pub(crate) fn apply_mrc_rewrites(doc: &mut Document, sites: &[MrcSite], fg_objec
             }
             let fg_name = fg_name.clone();
             for owner in owners {
-                let Some(Object::Dictionary(owner_dict)) = doc.objects.get_mut(&owner) else {
+                let Some(obj) = doc.objects.get_mut(&owner) else {
                     continue;
                 };
-                let mut resources = owner_dict
+                let dict = match obj {
+                    Object::Dictionary(d) => d,
+                    Object::Stream(s) => &mut s.dict,
+                    _ => continue,
+                };
+                let mut resources = dict
                     .get(b"Resources")
                     .ok()
                     .and_then(|r| r.as_dict().ok())
@@ -1958,7 +1957,7 @@ pub(crate) fn apply_mrc_rewrites(doc: &mut Document, sites: &[MrcSite], fg_objec
                     .unwrap_or_default();
                 xobjects.set(fg_name.clone(), Object::Reference(fg_object_id));
                 resources.set(b"XObject", Object::Dictionary(xobjects));
-                owner_dict.set(b"Resources", Object::Dictionary(resources));
+                dict.set(b"Resources", Object::Dictionary(resources));
             }
         }
     }

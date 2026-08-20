@@ -433,7 +433,9 @@ enables the default-off heavy passes behind `--compression
 `--zopfli`, `--font-subset`, `--jbig2`, `--jpeg2000`, `--mrc`. Each is a
 *candidate* in the same size court as the image pipeline, or a
 strictly-smaller-gated structural rewrite, and every one is validated by
-the regression suite (qpdf/poppler/mutool/gs gates, pixel-identical
+per-image fidelity gates (palette ≥0.9999 native SSIM; the bitonal masks —
+G4/JBIG2/MRC — on the classifier's measured reconstruction-error gate)
+plus the regression suite (qpdf/poppler/mutool/gs gates, pixel-identical
 rendering checks, text-extraction checks, and the same brutal
 "colored rectangle underneath + non-black current color" trap that
 `--raster-classify` already passes).
@@ -472,9 +474,10 @@ Readings and honest caveats:
 - **`--font-subset`** on a font-heavy document (194 KB with a full
   TrueType program) reaches ~7 KB with pixel-identical rendering and
   intact text extraction (rebuilt `/ToUnicode`, CID-font rewrite). The
-  pass is deliberately conservative: fonts whose used-glyph mapping cannot
-  be resolved exactly (unusual encodings, resource-less forms,
-  unparseable streams) are skipped rather than risk a glyph change.
+  pass is deliberately conservative and TrueType-only: fonts whose
+  used-glyph mapping cannot be resolved exactly (unusual encodings,
+  resource-less forms, unparseable streams) and CFF (`FontFile3`)
+  programs are skipped rather than risk a glyph change.
 - **`--dedup` / `--zopfli`** are structural passes with no fidelity
   surface: identical-stream coalescing and a strictly-smaller Zopfli
   re-encode, both verified byte-equivalent on the decoded content.
