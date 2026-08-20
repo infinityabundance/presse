@@ -28,6 +28,8 @@ use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod nvdec;
 #[cfg(feature = "rocm")]
 pub mod rocm;
 
@@ -249,7 +251,8 @@ pub enum Acceleration {
     /// Always use the CPU backend (default).
     #[default]
     Cpu,
-    /// Use the NVIDIA nvJPEG backend (requires the `cuda` feature).
+    /// Use the NVIDIA nvJPEG backend (requires the `cuda` feature);
+    /// baseline 4:2:0 JPEGs decode on the NVDEC hardware engine.
     Cuda,
     /// Use the AMD rocJPEG backend (requires the `rocm` feature).
     Rocm,

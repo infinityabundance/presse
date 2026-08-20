@@ -42,6 +42,19 @@ All notable changes to this project will be documented in this file.
 - **Flate-wrapped JPEG** — retained or re-encoded DCT streams that shrink
   under zlib are stored as `[FlateDecode, DCTDecode]` when the full flate
   result is smaller (OCRmyPDF-style trick).
+- **NVDEC hardware decode stage** (`--acceleration cuda`) — baseline 4:2:0
+  JPEGs decode on the NVDEC hardware engine through the Video Codec SDK
+  (`libnvcuvid.so.1`, a driver component; parser-free decode mirroring
+  ffmpeg's `nvdec_mjpeg.c`) instead of nvJPEG's entropy-decode kernels;
+  the NV12 output is de-interleaved to planar YUV by a tiny embedded-PTX
+  kernel the driver JIT-compiles. Progressive / 4:2:2 / 4:4:4 JPEGs keep
+  the nvJPEG decode. Optional: any init failure degrades to nvJPEG, and
+  `PRESSE_NO_NVDEC=1` forces that path. Verified pixel-equivalent vs
+  nvJPEG (≤1 IDCT rounding delta on <0.01% of pixels) by
+  `examples/nvdec_verify.rs`.
+- **Linear-time object renumbering** — lopdf's O(n²) `renumber_objects`
+  replaced with a hash-map pass (67k-object doc: 530 → 62 ms); bounded
+  dedup-cache hash (length + first/last 4 KiB).
 - **Parallel image re-encoding** — image streams are detached from the
   `Document`, re-encoded concurrently with rayon on owned buffers, and
   written back in a single serial pass (document-lock-free; only the dedup

@@ -22,7 +22,7 @@ default = []
 # baracuda's dynamic loader — no CUDA toolkit needed to build, no link-time
 # driver dependency. baracuda-cuda-sys supplies CUDA streams and pinned host
 # memory for the async pipeline.
-cuda = ["dep:baracuda-nvjpeg-sys", "dep:baracuda-cuda-sys"]
+cuda = ["dep:baracuda-nvjpeg-sys", "dep:baracuda-cuda-sys", "dep:libloading"]
 # AMD rocJPEG backend (--acceleration rocm). Loads librocjpeg at runtime.
 rocm = ["dep:libloading"]
 

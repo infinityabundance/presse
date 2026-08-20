@@ -147,6 +147,18 @@ RTX 4080 SUPER, 16-core CPU, `-C target-cpu=native`, `-q 50`:
   the multi-image case 1.054 → 0.716 s (1.47×) and beats 2-core CPU
   parallel (photos20 0.440 vs 0.626 s); 16-core CPU parallel still wins
   overall on wall time.
+- **NVDEC hardware decode stage (this PR):** baseline 4:2:0 JPEGs decode on
+  the NVDEC engine (Video Codec SDK, `libnvcuvid`). Per-image decode is
+  ~1.4× faster than the nvJPEG entropy-decode path on large high-quality
+  photos (2400×1800 q95: 15.7 vs 22.1 ms including the NV12→planar
+  conversion) and a wash on small/low-quality images — but the engine
+  serializes at ~5 MB/s per stream (ffmpeg's `mjpeg_cuvid` shows the same
+  ~24 ms/frame on this driver), so on the 16-way batched photo corpus the
+  stage is a wash vs the nvJPEG batch (photos20: 0.255–0.28 s with NVDEC vs
+  0.243–0.25 s without). The stage is optional and self-degrading
+  (`PRESSE_NO_NVDEC=1` forces the nvJPEG decode); it is verified
+  pixel-equivalent (≤1 IDCT-rounding delta on <0.01% of pixels) by
+  `examples/nvdec_verify.rs`.
 - GPU output is visually identical (SSIM 1.0000 on all 20 photo pages,
   qpdf clean) and 16–25 % smaller than the CPU encoder at the same quality
   (nvJPEG optimized Huffman).

@@ -278,14 +278,23 @@ Runtime needs:
 
 - **cuda** — an NVIDIA driver and the `nvjpeg` shared library. No CUDA
   toolkit is needed to *build*: the vendor library is loaded at runtime.
-  Validated on an RTX 4080 SUPER with CUDA 13.3.
+  Baseline 4:2:0 JPEGs are additionally decoded on the NVDEC hardware
+  engine through the Video Codec SDK (`libnvcuvid.so.1`, a driver
+  component — no toolkit library involved); the NV12→planar conversion
+  runs a tiny kernel that ships as embedded PTX, JIT-compiled by the
+  driver. Progressive / 4:2:2 / 4:4:4 JPEGs keep the nvJPEG decode path.
+  Validated on an RTX 4080 SUPER with CUDA 13.3 (verify with
+  `cargo run --release --features cuda --example nvdec_verify`).
 - **rocm** — compile-tested only; requires a ROCm installation with
   `rocjpeg` at runtime.
 
 If the driver or library is missing at runtime, presse warns and falls
 back to the CPU encoder per stream — a broken GPU can never drop or
-corrupt a stream. Measured behavior (threshold routing, speed vs size
-tradeoffs) is documented in [`benches/docker/RESULTS.md`](benches/docker/RESULTS.md).
+corrupt a stream. The NVDEC stage is optional the same way: when
+`libnvcuvid` or the PTX JIT is unavailable, decode stays on nvJPEG
+(`PRESSE_NO_NVDEC=1` forces that path). Measured behavior (threshold
+routing, speed vs size tradeoffs) is documented in
+[`benches/docker/RESULTS.md`](benches/docker/RESULTS.md).
 
 ## Limitations
 

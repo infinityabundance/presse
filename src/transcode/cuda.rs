@@ -38,11 +38,19 @@
 //! streams in [`GpuState`] are never explicitly destroyed — the no-op
 //! [`Drop for GpuState`](GpuState) documents why (the C++ destroy functions
 //! can throw across the FFI boundary). Do not add a destructor.
+//!
+//! **NVDEC decode stage:** baseline 4:2:0 JPEGs are decoded on the dedicated
+//! hardware engine through the Video Codec SDK (libnvcuvid, [`super::nvdec`])
+//! instead of nvJPEG's entropy-decode kernels, then converted NV12 → planar
+//! YUV on device and handed to the same `nvjpegEncodeYUV` encode path.
+//! Progressive / 4:2:2 / 4:4:4 JPEGs keep the nvJPEG decode. The stage is
+//! optional: if it fails to initialize, decode stays on nvJPEG.
 
 use baracuda_cuda_sys::runtime::types::cudaStreamFlags;
 use baracuda_cuda_sys::runtime::{self as cudart, cudaError_t, cudaStream_t};
 use baracuda_nvjpeg_sys as nvjpeg;
 
+use crate::transcode::nvdec::{self, Nvdec};
 use crate::transcode::{ImageRef, ImageTranscoder, Input, TranscodeError, jpeg_components};
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -300,14 +308,26 @@ fn css_enum(subsampling: c_int) -> nvjpeg::nvjpegChromaSubsampling_t {
     }
 }
 
+/// One YUV-device-path image in a batch: position in the job slice, image
+/// dimensions, chroma subsampling, and whether the decode stage is NVDEC
+/// hardware (baseline 4:2:0) instead of nvjpeg.
+#[derive(Clone, Copy)]
+struct YuvJob {
+    idx: usize,
+    w: u32,
+    h: u32,
+    sub: c_int,
+    nvdec: bool,
+}
+
 /// Group YUV-eligible jobs into batches bounded by count and by total
 /// decoded bytes (so a batch of huge photos cannot blow VRAM).
-fn yuv_chunks(items: &[(usize, u32, u32, c_int)]) -> Vec<&[(usize, u32, u32, c_int)]> {
+fn yuv_chunks(items: &[YuvJob]) -> Vec<&[YuvJob]> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut bytes = 0usize;
-    for (k, &(_, w, h, sub)) in items.iter().enumerate() {
-        let size = yuv_geometry(w as usize, h as usize, sub).3;
+    for (k, &job) in items.iter().enumerate() {
+        let size = yuv_geometry(job.w as usize, job.h as usize, job.sub).3;
         if k - start >= BATCH_MAX || (bytes > 0 && bytes + size > BATCH_BUDGET_BYTES) {
             out.push(&items[start..k]);
             start = k;
@@ -337,6 +357,9 @@ struct GpuState {
     /// One non-blocking CUDA stream per batch slot.
     streams: Vec<cudaStream_t>,
     async_alloc: bool,
+    /// Optional NVDEC hardware-decode stage (baseline 4:2:0 JPEGs). None
+    /// when libnvcuvid/PTX init failed — decode then stays on nvjpeg.
+    nvdec: Option<Nvdec>,
     /// Reusable pinned output buffers (one per batch slot).
     pinned: Vec<HostBuf>,
     pinned_cap: Vec<usize>,
@@ -435,6 +458,27 @@ impl GpuState {
             }
             let async_alloc = stream_ordered_alloc_ok(streams[0]);
 
+            // NVDEC is a decode accelerator, never a correctness dependency:
+            // when it cannot initialize (missing libnvcuvid, driver too old
+            // for the embedded PTX, context errors) the backend keeps running
+            // on the nvjpeg decode path. `PRESSE_NO_NVDEC=1` forces the
+            // nvjpeg path for A/B benchmarking/debugging.
+            let nvdec = if std::env::var_os("PRESSE_NO_NVDEC").is_some() {
+                eprintln!("warning: PRESSE_NO_NVDEC=1 — decode stage stays on nvJPEG");
+                None
+            } else {
+                match Nvdec::new() {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: NVDEC hardware decode unavailable ({e}); \
+                                   decoding baseline 4:2:0 via nvJPEG"
+                        );
+                        None
+                    }
+                }
+            };
+
             Ok(Self {
                 lib,
                 handle,
@@ -443,6 +487,7 @@ impl GpuState {
                 encoder_params,
                 streams,
                 async_alloc,
+                nvdec,
                 pinned: Vec::new(),
                 pinned_cap: Vec::new(),
             })
@@ -507,6 +552,32 @@ impl GpuState {
             ptr: p as *mut u8,
             stream,
             async_alloc: self.async_alloc,
+        })
+    }
+
+    /// Allocate a device buffer with plain `cudaMalloc`/`cudaFree`.
+    ///
+    /// The NVDEC conversion kernel is launched through the CUDA *driver* API
+    /// (cuLaunchKernel with the embedded PTX), and its stores into
+    /// stream-ordered pool memory (`cudaMallocAsync`) silently do not land on
+    /// this driver — the buffer reads back all zeros, while runtime-launched
+    /// kernels (nvjpeg) write the same pool memory fine. NVDEC decode targets
+    /// therefore bypass the pool. (Measured cost of the plain alloc/free pair
+    /// is ~50–100 µs per image.)
+    unsafe fn alloc_device_plain(&self, len: usize) -> Result<DeviceBuf, TranscodeError> {
+        let mut p: *mut c_void = ptr::null_mut();
+        let pfn = cudart::runtime()
+            .map_err(|e| TranscodeError::Gpu(format!("cuda runtime: {e}")))?
+            .cuda_malloc()
+            .map_err(|e| TranscodeError::Gpu(format!("cudaMalloc: {e}")))?;
+        check_cuda(unsafe { pfn(&mut p, len) })?;
+        if p.is_null() {
+            return Err(TranscodeError::Gpu("cudaMalloc returned null".into()));
+        }
+        Ok(DeviceBuf {
+            ptr: p as *mut u8,
+            stream: ptr::null_mut(),
+            async_alloc: false,
         })
     }
 
@@ -855,37 +926,65 @@ impl GpuState {
     /// each decoding to device memory and re-encoding from it, then one
     /// query/copy round per slot. Falls back per-image on any failure so a
     /// single bad stream never drags the whole batch to the CPU path.
-    fn process_chunk(&mut self, jobs: &mut [Job], chunk: &[(usize, u32, u32, c_int)]) {
+    fn process_chunk(&mut self, jobs: &mut [Job], chunk: &[YuvJob]) {
         if self.run_chunk(jobs, chunk).is_err() {
             let _ = unsafe { sync_stream(self.streams[0]) };
-            for &(idx, ..) in chunk {
-                self.process_single(jobs, idx);
+            for &job in chunk {
+                self.process_single(jobs, job.idx);
             }
         }
     }
 
-    fn run_chunk(
-        &mut self,
-        jobs: &mut [Job],
-        chunk: &[(usize, u32, u32, c_int)],
-    ) -> Result<(), TranscodeError> {
+    fn run_chunk(&mut self, jobs: &mut [Job], chunk: &[YuvJob]) -> Result<(), TranscodeError> {
         let n = chunk.len();
-        let quality = jobs[chunk[0].0].quality;
+        let quality = jobs[chunk[0].idx].quality;
 
         unsafe {
             // Device YUV buffers + the per-slot decode/encode chains. The
-            // JPEG bytes stay on the host; nvjpegDecode reads them and
-            // writes the decoded YUV straight to device memory.
+            // JPEG bytes stay on the host; the decode stage writes the
+            // decoded YUV straight to device memory — NVDEC hardware for
+            // baseline 4:2:0 (`job.nvdec`, with an NV12 → planar conversion
+            // kernel), nvjpegDecode otherwise.
             let mut devs: Vec<DeviceBuf> = Vec::with_capacity(n);
             let mut sizes = vec![0usize; n];
-            for (k, &(idx, w, h, sub)) in chunk.iter().enumerate() {
-                let JobInput::Jpeg(bytes) = &jobs[idx].input else {
+            for (k, &job) in chunk.iter().enumerate() {
+                let JobInput::Jpeg(bytes) = &jobs[job.idx].input else {
                     continue;
                 };
-                let (_, _, _, len) = yuv_geometry(w as usize, h as usize, sub);
-                let dev = self.alloc_device(len, self.streams[k])?;
-                self.enqueue_decode_to_device(bytes, w as usize, h as usize, sub, &dev, k)?;
-                self.enqueue_encode_yuv(w, h, sub, &dev, quality, k, k)?;
+                let (py, puv, _, len) = yuv_geometry(job.w as usize, job.h as usize, job.sub);
+                // NVDEC decode targets use plain cudaMalloc: the driver-API
+                // conversion kernel's stores do not land in async-pool memory
+                // (see `alloc_device_plain`).
+                let dev = if job.nvdec {
+                    self.alloc_device_plain(len)?
+                } else {
+                    self.alloc_device(len, self.streams[k])?
+                };
+                if job.nvdec {
+                    // NVDEC: hardware decode + NV12 → planar conversion on
+                    // this slot's stream. The slot stream is synchronized
+                    // inside before the decode surface is unmapped, so the
+                    // engine can start the next decode while this slot's
+                    // convert/encode work drains.
+                    let stream = self.streams[k];
+                    let nvdec = self
+                        .nvdec
+                        .as_mut()
+                        .ok_or_else(|| TranscodeError::Gpu("NVDEC stage disappeared".into()))?;
+                    nvdec.decode_to_planar(
+                        bytes, job.w, job.h, dev.ptr, py as u32, puv as u32, stream,
+                    )?;
+                } else {
+                    self.enqueue_decode_to_device(
+                        bytes,
+                        job.w as usize,
+                        job.h as usize,
+                        job.sub,
+                        &dev,
+                        k,
+                    )?;
+                }
+                self.enqueue_encode_yuv(job.w, job.h, job.sub, &dev, quality, k, k)?;
                 self.enqueue_size_query(k, k, &mut sizes[k])?;
                 devs.push(dev);
             }
@@ -909,9 +1008,9 @@ impl GpuState {
                 sync_stream(self.streams[k])?;
             }
 
-            for (k, &(idx, _, _, _)) in chunk.iter().enumerate() {
+            for (k, &job) in chunk.iter().enumerate() {
                 let out = self.pinned_buf(k, sizes[k]).as_slice()[..sizes[k]].to_vec();
-                let _ = jobs[idx].reply.send(Ok(out));
+                let _ = jobs[job.idx].reply.send(Ok(out));
             }
             // `devs` drop here: every stream has drained, so the device
             // buffers are free to return to the pool.
@@ -920,10 +1019,12 @@ impl GpuState {
     }
 
     /// Classify the batch and dispatch: YUV-capable JPEGs (3 components,
-    /// 4:2:0/4:2:2/4:4:4) through the device path; everything else through
-    /// the per-image path.
+    /// 4:2:0/4:2:2/4:4:4) through the device path — with NVDEC hardware
+    /// decode for baseline 4:2:0 — and everything else through the per-image
+    /// path.
     fn process(&mut self, jobs: &mut [Job]) {
-        let mut yuv: Vec<(usize, u32, u32, c_int)> = Vec::new();
+        let nvdec_ok = self.nvdec.is_some();
+        let mut yuv: Vec<YuvJob> = Vec::new();
         let mut single: Vec<usize> = Vec::new();
         for (i, job) in jobs.iter().enumerate() {
             match &job.input {
@@ -931,7 +1032,15 @@ impl GpuState {
                     Ok((w, h, sub, ncomp))
                         if ncomp == 3 && matches!(sub, CSS_420 | CSS_422 | CSS_444) =>
                     {
-                        yuv.push((i, w, h, sub))
+                        yuv.push(YuvJob {
+                            idx: i,
+                            w,
+                            h,
+                            sub,
+                            // NVDEC decodes baseline (SOF0) 4:2:0 only;
+                            // progressive / 4:2:2 / 4:4:4 stay on nvjpeg.
+                            nvdec: nvdec_ok && sub == CSS_420 && nvdec::jpeg_sof0(bytes),
+                        })
                     }
                     _ => single.push(i),
                 },
