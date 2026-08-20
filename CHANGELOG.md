@@ -37,6 +37,57 @@ All notable changes to this project will be documented in this file.
   pages stay on the JPEG path. Conservative by design: only mostly
   black-and-white rasters with glyph-sized components are masked. The
   smallest of original / JPEG / indexed / mask wins per image.
+- **`optimize` feature + `--compression` presets** — a new Cargo feature
+  (`--features optimize`) backs the default-off heavyweight passes:
+  `--compression {fast,balanced,small,smallest}` presets that expand to
+  `--dedup`, `--zopfli`, `--font-subset`, `--jbig2`, `--jpeg2000` and
+  `--mrc`. Every pass follows the image pipeline's discipline — applied
+  only when strictly smaller (or provably rendering-equivalent *and*
+  smaller), lossless where claimed, a no-op on anything it cannot prove
+  safe. The flags fail with an explicit build hint when the feature is
+  absent.
+- **`--dedup`** (`optimize` feature, off by default) — the duplicate-image
+  coalescer extended to every stream: byte-identical FontFile programs,
+  ICC profiles, XForms, patterns and arbitrary streams collapse onto one
+  canonical object with every reference rewritten (identical stream +
+  identical dictionary renders identically, so lossless by construction).
+- **`--zopfli`** (`optimize` feature, off by default) — the
+  `--recompress-flate` pass with the Zopfli deflate search instead of
+  level-9 zlib: a few percent smaller on text/content streams, kept only
+  when strictly smaller.
+- **`--font-subset`** (`optimize` feature, off by default) — embedded
+  TrueType/CFF fonts are subset to the glyphs the content streams actually
+  show (typst's `subsetter`) and rewritten as CID fonts (`/Identity-H` +
+  identity `CIDToGIDMap`) with the text strings remapped in place and a
+  rebuilt `/ToUnicode`; fonts whose used-glyph mapping cannot be resolved
+  exactly are skipped, and the subset is kept only when strictly smaller
+  (194 KB TrueType font-heavy PDF → ~7 KB, pixel-identical rendering,
+  text extraction intact).
+- **`--jbig2`** (`optimize` feature, off by default) — a lossless JBIG2
+  candidate (Rust `jbig2enc-rust`, symbol-dictionary mode) for the same
+  1-bit masks the G4 candidate uses; repeated glyph shapes share one
+  dictionary entry. The size court keeps the smaller of G4 / JBIG2 /
+  original. The encoder's output is oracled against
+  poppler/ghostscript/mutool (identity `/Decode` polarity, verified
+  pixel-identically).
+- **`--jpeg2000`** (`optimize` feature, off by default) — a JPEG2000
+  candidate (pure-Rust `j2k` codec) for continuous-tone images, emitted as
+  a minimal JP2 file (signature / file-type / image-header + sRGB /
+  codestream boxes) so poppler decodes it cleanly, rate-targeted at 85% of
+  the JPEG candidate's bytes so it wins only when genuinely smaller at
+  comparable rate.
+- **`--mrc`** (`optimize` feature, off by default) — the mixed-raster
+  composite commercial scan compressors use: heavily downsampled JPEG
+  background (ink painted out), solid ink-color foreground composited
+  through a high-resolution lossless CCITT G4 mask as its `/SMask`, with
+  the content streams rewritten to draw background then foreground at the
+  captured CTM. This is the intended home for mask compositing (the
+  graphics state is under presse's control, so the composite cannot leak
+  background or recolor ink — regression-tested pixel-identically under a
+  blue rectangle with a red current color). The mask is always G4:
+  poppler's JBIG2 decoder inverts its samples, which would make the mask
+  polarity viewer-dependent.
+
 - **`--recompress-flate`** (`press --recompress-flate`, off by default) —
   qpdf-style structural recompression: existing `/FlateDecode` streams are
   decoded and re-encoded at the writer's level 9, each kept only when

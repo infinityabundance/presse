@@ -44,8 +44,13 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/SimonBure/presse/r
 Download the `.msi` from the [latest release](https://github.com/SimonBure/presse/releases/latest).
 
 ### Cargo
+
 ```bash
+# JPEG-only pipeline (the default, smaller/faster to build)
 cargo install presse
+# + the optimize passes (--compression, --dedup, --zopfli, --font-subset,
+#   --jbig2, --jpeg2000, --mrc)
+cargo install presse --features optimize
 ```
 
 ## Benchmark
@@ -127,6 +132,13 @@ presse merge *.png *.pdf
 | `--jpeg-encoder` | `false` | Use the pure-Rust `jpeg-encoder` codec (YCbCr 4:2:0, box-averaged chroma — libjpeg's default model, which Ghostscript/qpdf use) instead of the `image` crate's 4:4:4 encoder; smaller RGB output at the same `-q`, faster, but opt-in because luminance-SSIM courts don't see chroma loss |
 | `--raster-classify` | `false` | Run the raster classifier on every decoded image: bitonal text/rules stored as a photographic RGB raster are re-stored as a 1-bit CCITT G4 opaque `DeviceGray` image (an RGB page → a few KB of G4). The G4 encoding of the 1-bit payload is lossless; the RGB→bitonal conversion itself is lossy, which is why only near-perfect black-and-white content is masked. Flat-color figures get the `/Indexed` palette candidate; photos and mixed pages are never masked. The smallest of original / JPEG / indexed / mask wins per image |
 | `--recompress-flate` | `false` | qpdf-style structural recompression: decode existing `/FlateDecode` streams and re-encode them at the writer's level 9, keeping each only when smaller. Lossless (no content-byte changes); recovers the compression-level gap form tools leave behind |
+| `-c, --compression` | `fast` | Effort preset that enables the default-off flags together: `fast` (JPEG-only), `balanced` (+ `--dedup`), `small` (+ `--zopfli`, `--recompress-flate`), `smallest` (+ `--jbig2`, `--jpeg2000`, `--font-subset`, `--mrc` and every structural pass). Individual flags still work on their own; modes other than `fast` require the `optimize` feature build |
+| `--dedup` | `false` | Coalesce byte-identical non-image streams (fonts, ICC profiles, XForms, patterns, arbitrary streams) onto one canonical object, rewriting every reference — the duplicate-image pattern extended to the whole document. Lossless; requires the `optimize` feature |
+| `--zopfli` | `false` | Like `--recompress-flate`, but the re-encode uses the Zopfli deflate search — deliberately CPU-hungry, routinely a few % smaller than level-9 zlib on text/content streams. Strictly-smaller gate; pure size win at CPU cost; requires the `optimize` feature |
+| `--font-subset` | `false` | Subset every embedded TrueType/CFF font to the glyphs the content streams actually show (typst's `subsetter`), rewritten as a CID font with a rebuilt `ToUnicode`. Fonts are skipped unless the used-glyph mapping resolves exactly and the subset is strictly smaller; requires the `optimize` feature |
+| `--jbig2` | `false` | Add a lossless JBIG2 (symbol-dictionary) candidate for bitonal content alongside the CCITT G4 one — repeated glyph shapes share one dictionary entry; the size court keeps the smaller of G4 / JBIG2 / original per image; requires the `optimize` feature |
+| `--jpeg2000` | `false` | Add a JPEG2000 (JPXDecode, minimal JP2 file) candidate for continuous-tone images, rate-targeted at 85% of the JPEG candidate's byte budget so the court prefers it only when genuinely smaller at comparable rate; requires the `optimize` feature |
+| `--mrc` | `false` | Build a real mixed-raster composite for classified bitonal scans — heavily downsampled JPEG background, solid ink-color foreground composited through a high-resolution lossless CCITT G4 mask as its `/SMask`, content rewritten to draw background then foreground (the ABBYY/LEADTOOLS/Pdftools representation); requires the `optimize` feature |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -235,6 +247,77 @@ decompress are left alone), each re-encoded stream is kept only when
 smaller, and the pass is lossless: pixels, text, metadata and fonts are
 unchanged, only the compressed representation differs. Only `press` takes
 the flag today.
+
+### Optimize-feature passes (`--compression`, codecs, fonts, dedup)
+
+The heavyweight candidates live behind the `optimize` Cargo feature
+(`cargo install --features optimize` or `cargo build --release --features
+optimize`) and default-off CLI flags. Each pass follows the same
+discipline as the image pipeline: a representation is applied only when it
+is *strictly smaller* (or provably rendering-equivalent *and* smaller), is
+lossless where claimed, and degrades to a no-op on anything it cannot
+prove safe. The flags are independent and compose; `--compression`
+presets expand to them:
+
+- **`--dedup`** — the duplicate-image coalescer extended to every stream:
+  byte-identical FontFile programs, ICC profiles, XForms, patterns and
+  arbitrary streams collapse onto one canonical object with every
+  reference rewritten. Identical stream + identical dictionary renders
+  identically, so this is lossless by construction.
+- **`--zopfli`** — the `--recompress-flate` pass with the Zopfli deflate
+  search instead of level-9 zlib: same decoded bytes, a few percent
+  smaller on text/content streams, kept only when strictly smaller.
+- **`--font-subset`** — embedded TrueType/CFF fonts are subset to the
+  glyphs the content streams actually show (typst's `subsetter`) and
+  rewritten as CID fonts (`/Identity-H` + identity `CIDToGIDMap`) with the
+  text strings remapped in place and a rebuilt `/ToUnicode`, so rendering
+  and text extraction are unchanged. A font is skipped whenever the
+  used-glyph mapping cannot be resolved exactly (unusual encodings,
+  resource-less forms, unparseable streams) and the subset is kept only
+  when strictly smaller. A font-heavy PDF (194 KB with a full TrueType
+  program) becomes ~7 KB with pixel-identical rendering.
+- **`--jbig2`** — a lossless JBIG2 candidate (Rust `jbig2enc-rust`,
+  symbol-dictionary mode) for the same 1-bit masks the G4 candidate uses:
+  repeated glyph shapes share one dictionary entry, which is where G4
+  loses to JBIG2 on text pages. The encoder's output is oracled against
+  poppler/ghostscript/mutool in the regression suite (its A.3.6 flush
+  marker makes poppler print a benign "extraneous byte" notice, and its
+  sample polarity is the *identity* `/Decode`, the opposite of G4's —
+  both verified pixel-identically). The size court keeps the smaller of
+  G4 / JBIG2 / original.
+- **`--jpeg2000`** — a JPEG2000 candidate (pure-Rust `j2k` codec) for
+  continuous-tone images, emitted as a minimal JP2 file (signature /
+  file-type / image-header + sRGB / codestream boxes — poppler parses the
+  JP2 file form cleanly, where a raw codestream only renders after noisy
+  fallback), rate-targeted at 85% of the JPEG candidate's bytes so it
+  wins only when genuinely smaller at comparable rate. On the 18 MB
+  image-heavy corpus the photo pages re-encode at a mean luma difference
+  of ~1.3 levels. Ghostscript's JPX decoder is broken on *all* JP2 files
+  (including OpenJPEG's own), so the regression oracle is
+  poppler + mutool + OpenJPEG.
+- **`--mrc`** — the mixed-raster composite commercial scan compressors
+  use: a heavily downsampled JPEG background (ink painted out with the
+  median paper color), a solid ink-color foreground, and a
+  high-resolution lossless CCITT G4 mask composited as the foreground's
+  `/SMask`; the content stream is rewritten to draw background then
+  foreground with the CTM captured at the original `Do`. This is the
+  *intended* home for mask compositing — unlike a stencil dropped in for
+  an opaque raster, the graphics state and the layers beneath are under
+  presse's control, so the composite cannot leak background through the
+  paper or recolor the ink (regression-tested pixel-identically under a
+  blue rectangle with a red current color). The mask is always G4:
+  poppler's JBIG2 decoder inverts its samples, which would make the mask
+  polarity viewer-dependent. On a 3.4 MB grainy scan corpus the composite
+  lands at ~280 KB with the paper grain preserved (a flat 1-bit G4
+  version is smaller still at ~1 KB but throws the grain away). Note:
+  poppler's Splash renderer prints a "Bogus memory allocation size"
+  notice on large full-bleed masked images (its own masked-image path —
+  mutool and ghostscript render the same files cleanly, and poppler's
+  output is still pixel-accurate).
+
+`--compression small` / `smallest` are the "leave nothing on the table"
+presets: `smallest` on the scan corpus reaches ~1.1 KB (JBIG2 masks) and
+on the photo corpus ~2.6 MB at near-lossless measured fidelity.
 
 ### Merge — `presse merge`
 

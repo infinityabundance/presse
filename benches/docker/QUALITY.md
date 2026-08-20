@@ -424,3 +424,65 @@ small-heavy):
 Warm per-doc GPU cost is ~0.256 s vs CPU ~0.313 s (~18% faster per
 document); the init is what single-shot burns. The GPU wins in batch
 pipelines, not one-shot invocations.
+
+## The `optimize` feature: codec candidates, fonts and structural passes
+
+The `optimize` Cargo feature (`cargo build --release --features optimize`)
+enables the default-off heavy passes behind `--compression
+{fast,balanced,small,smallest}` and the individual flags `--dedup`,
+`--zopfli`, `--font-subset`, `--jbig2`, `--jpeg2000`, `--mrc`. Each is a
+*candidate* in the same size court as the image pipeline, or a
+strictly-smaller-gated structural rewrite, and every one is validated by
+the regression suite (qpdf/poppler/mutool/gs gates, pixel-identical
+rendering checks, text-extraction checks, and the same brutal
+"colored rectangle underneath + non-black current color" trap that
+`--raster-classify` already passes).
+
+Measured on the synthetic corpus (deterministic, best-of-1):
+
+| corpus file | default (`fast`) | `--mrc` | `--jbig2` | `--compression smallest` |
+|---|---|---|---|---|
+| scanned.pdf (3.40 MB, 3 grainy gray pages) | 0.73 MB | 0.28 MB | 1.3 KB | 1.1 KB |
+| image-heavy.pdf (17.98 MB, 60 photos) | ~4.8 MB | — | — | 2.59 MB |
+
+Readings and honest caveats:
+
+- The **scanned** row shows the three bitonal regimes: `fast` pays
+  photographic cost for document content (0.73 MB), `--mrc` keeps the
+  paper grain in a downsampled background while the text lives in a
+  lossless G4 mask (0.28 MB, mean luma diff ~3.5 vs the source at 30 dpi,
+  visually the closest of the three to the original), and `--jbig2` /
+  `smallest` collapse the page to a flat 1-bit mask (~1 KB, pixel-identical
+  to the equivalent `--raster-classify` G4 output — the grain is gone, as
+  with any bitonal representation). The size court picks the smallest per
+  image, so on real scans the winner depends on how much paper texture is
+  worth keeping.
+- **`--jpeg2000`** re-encodes the 60-photo corpus to ~2.6 MB (the same
+  order as `--jpeg2000` alone: 2.59 MB) at a mean luma difference of
+  ~1.3 levels vs the source on sampled pages — visually equivalent, but
+  the JPEG candidate wins or ties on most photos, so the flag mainly pays
+  off where J2K's rate-distortion genuinely beats JPEG. The codestream is
+  wrapped in a minimal JP2 file (signature/file-type/image-header+sRGB/
+  codestream boxes): poppler decodes that cleanly where a raw codestream
+  only renders after noisy fallback. Ghostscript's JPX decoder is broken
+  on *all* JP2 files (reproduces with OpenJPEG's own output), so the
+  regression oracle for JPX is poppler + mutool + OpenJPEG.
+- **`--font-subset`** on a font-heavy document (194 KB with a full
+  TrueType program) reaches ~7 KB with pixel-identical rendering and
+  intact text extraction (rebuilt `/ToUnicode`, CID-font rewrite). The
+  pass is deliberately conservative: fonts whose used-glyph mapping cannot
+  be resolved exactly (unusual encodings, resource-less forms,
+  unparseable streams) are skipped rather than risk a glyph change.
+- **`--dedup` / `--zopfli`** are structural passes with no fidelity
+  surface: identical-stream coalescing and a strictly-smaller Zopfli
+  re-encode, both verified byte-equivalent on the decoded content.
+- **Poppler notes discovered while oracling these codecs**: its JBIG2
+  decoder emits *inverted* samples (so JBIG2 images use the identity
+  `/Decode`, the opposite of G4's `[1 0]`), its JBIG2 parser warns
+  "extraneous byte after segment" on the encoder's spec-mandated A.3.6
+  flush marker (non-fatal, output correct), and its Splash renderer prints
+  "Bogus memory allocation size" on large full-bleed masked images
+  (mutool/gs render the same files cleanly and poppler's output is still
+  pixel-accurate). These are renderer quirks, not presse defects — each is
+  documented next to the code that works around it.
+
