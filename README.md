@@ -138,7 +138,7 @@ presse merge *.png *.pdf
 | `--font-subset` | `false` | Subset every embedded TrueType/CFF font to the glyphs the content streams actually show (typst's `subsetter`), rewritten as a CID font with a rebuilt `ToUnicode`. Fonts are skipped unless the used-glyph mapping resolves exactly and the subset is strictly smaller; requires the `optimize` feature |
 | `--jbig2` | `false` | Add a lossless JBIG2 (symbol-dictionary) candidate for bitonal content alongside the CCITT G4 one — repeated glyph shapes share one dictionary entry; the size court keeps the smaller of G4 / JBIG2 / original per image; requires the `optimize` feature |
 | `--jpeg2000` | `false` | Add a JPEG2000 (JPXDecode, minimal JP2 file) candidate for continuous-tone images, rate-targeted at 85% of the JPEG candidate's byte budget so the court prefers it only when genuinely smaller at comparable rate; requires the `optimize` feature |
-| `--mrc` | `false` | Build a real mixed-raster composite for classified bitonal scans — heavily downsampled JPEG background, solid ink-color foreground composited through a high-resolution lossless CCITT G4 mask as its `/SMask`, content rewritten to draw background then foreground (the ABBYY/LEADTOOLS/Pdftools representation); requires the `optimize` feature |
+| `--mrc` | `false` | Build a real mixed-raster composite for classified bitonal scans — a solid paper-color background (median paper color, emitted as a 1×1 image), solid ink-color foreground composited through a high-resolution lossless CCITT G4 mask as its `/SMask`, content rewritten to draw background then foreground (the ABBYY/LEADTOOLS/Pdftools representation); requires the `optimize` feature |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -296,11 +296,16 @@ presets expand to them:
   (including OpenJPEG's own), so the regression oracle is
   poppler + mutool + OpenJPEG.
 - **`--mrc`** — the mixed-raster composite commercial scan compressors
-  use: a heavily downsampled JPEG background (ink painted out with the
-  median paper color), a solid ink-color foreground, and a
-  high-resolution lossless CCITT G4 mask composited as the foreground's
-  `/SMask`; the content stream is rewritten to draw background then
-  foreground with the CTM captured at the original `Do`. This is the
+  use: a solid paper-color background (the median paper color, emitted as
+  a 1×1 image — deliberately *not* a JPEG, because near-flat JPEG
+  bitstreams are mis-decoded as full-page gradients by poppler and
+  Ghostscript), a solid ink-color foreground, and a high-resolution
+  lossless CCITT G4 mask composited as the foreground's `/SMask` (a full
+  image XObject — Ghostscript silently drops a soft mask whose stream
+  lacks `/Type /XObject` + `/Subtype /Image`); the content stream is
+  rewritten to draw background then foreground *without* re-applying the
+  placement `cm` (the source image's transform is already current there;
+  re-emitting it squares the scale). This is the
   *intended* home for mask compositing — unlike a stencil dropped in for
   an opaque raster, the graphics state and the layers beneath are under
   presse's control, so the composite cannot leak background through the
@@ -308,12 +313,11 @@ presets expand to them:
   blue rectangle with a red current color). The mask is always G4:
   poppler's JBIG2 decoder inverts its samples, which would make the mask
   polarity viewer-dependent. On a 3.4 MB grainy scan corpus the composite
-  lands at ~280 KB with the paper grain preserved (a flat 1-bit G4
-  version is smaller still at ~1 KB but throws the grain away). Note:
-  poppler's Splash renderer prints a "Bogus memory allocation size"
-  notice on large full-bleed masked images (its own masked-image path —
-  mutool and ghostscript render the same files cleanly, and poppler's
-  output is still pixel-accurate).
+  lands at ~4 KB with the paper grain preserved as a flat fill (a flat
+  1-bit G4 version is smaller still at ~1 KB but throws the grain away).
+  poppler/mutool/ghostscript render the composite pixel-identically; the
+  earlier poppler "Bogus memory allocation size" notice on large
+  full-bleed masked images was the double-`cm` rewrite bug, fixed here.
 
 `--compression small` / `smallest` are the "leave nothing on the table"
 presets: `smallest` on the scan corpus reaches ~1.1 KB (JBIG2 masks) and

@@ -1431,22 +1431,38 @@ pub(crate) mod codecs {
         s[s.len() / 2]
     }
 
-    /// Build the three MRC layers for a classified bitonal scan: a
-    /// downsampled JPEG background with the ink painted out, a solid-color
-    /// foreground (the median ink color), and the high-res mask bytes.
+    /// Build the three MRC layers for a classified bitonal scan: a solid
+    /// paper-color background (the median paper color, emitted as a 1×1
+    /// image), a solid-color foreground (the median ink color), and the
+    /// high-res mask bytes.
     ///
-    /// Returns `(bg_jpeg, bg_dims, fg_color, mask_bytes, mask_codec,
-    /// global)` where `mask_codec` is `b"CCITTFaxDecode"` or
-    /// `b"JBIG2Decode"` and `global` is the optional JBIG2 dictionary.
+    /// Returns `(bg, bg_dims, fg_color, mask_bytes, mask_codec, global)`
+    /// where `bg` is the 3-byte paper color, `bg_dims` is always `(1, 1)`,
+    /// `mask_codec` is `b"CCITTFaxDecode"` and `global` is `None` (the mask
+    /// is never JBIG2 — see below).
+    ///
+    /// # Design rationale
+    ///
+    /// The background is deliberately *not* a downsampled JPEG of the
+    /// ink-painted paper. A bitonal scan's paper is (by classification)
+    /// near-uniform, so the painted image is a flat color plus JPEG noise —
+    /// and exactly that content (a near-flat image with tiny noise) is
+    /// mis-decoded by poppler's and Ghostscript's JPEG paths as a
+    /// full-page gradient (verified against `image`-crate, libjpeg, and
+    /// PIL-encoded bitstreams; mutool and libjpeg decode them flat). A
+    /// flat 1×1 paper image renders identically in every renderer and
+    /// removes the DCT stream from the composite entirely. (The poppler
+    /// "Bogus memory allocation size" notice that motivated this was a
+    /// separate bug: the content rewrite used to re-emit the placement
+    /// `cm` for the foreground, squaring the scale — fixed in
+    /// `apply_mrc_rewrites`.)
     #[allow(clippy::type_complexity)]
-    pub fn mrc_layers<T: crate::transcode::ImageTranscoder>(
+    pub fn mrc_layers(
         rgb: &[u8],
         w: u32,
         h: u32,
         mask: &[u8],
-        quality: u8,
         jbig2: bool,
-        transcoder: &T,
     ) -> Result<
         (
             Vec<u8>,
@@ -1488,44 +1504,6 @@ pub(crate) mod codecs {
         let fg = [median(&ink_r), median(&ink_g), median(&ink_b)];
         let bg = [median(&paper_r), median(&paper_g), median(&paper_b)];
 
-        // Background: ink pixels painted with the paper color, downsampled so
-        // the JPEG cost of the paper texture stays low.
-        let max_dim = 1024u32;
-        let scale = (max_dim as f32 / w.max(h) as f32).min(1.0);
-        let (bw, bh) = (
-            ((w as f32 * scale).round() as u32).max(1),
-            ((h as f32 * scale).round() as u32).max(1),
-        );
-        let mut painted = rgb.to_vec();
-        for y in 0..h as usize {
-            let mrow = y * row_bytes;
-            let prow = y * (w as usize) * 3;
-            for x in 0..w as usize {
-                if (mask[mrow + x / 8] >> (7 - (x % 8))) & 1 == 1 {
-                    let p = prow + x * 3;
-                    painted[p..p + 3].copy_from_slice(&bg);
-                }
-            }
-        }
-        let mut down = vec![0u8; (bw as usize) * (bh as usize) * 3];
-        for y in 0..bh as usize {
-            let sy = ((y as f32 / scale) as usize).min(h as usize - 1);
-            for x in 0..bw as usize {
-                let sx = ((x as f32 / scale) as usize).min(w as usize - 1);
-                let sp = (sy * (w as usize) + sx) * 3;
-                let dp = (y * (bw as usize) + x) * 3;
-                down[dp..dp + 3].copy_from_slice(&painted[sp..sp + 3]);
-            }
-        }
-        let input = crate::transcode::Input::Pixels(crate::transcode::ImageRef::Rgb8 {
-            width: bw,
-            height: bh,
-            bytes: &down,
-        });
-        let bg_jpeg = transcoder
-            .transcode_image(&input, quality)
-            .map_err(|e| e.to_string())?;
-
         // Mask: G4 (1 = ink, MSB-first, same bits as the opaque image
         // candidate). JBIG2 is deliberately *not* offered for the mask:
         // poppler's JBIG2 decoder emits inverted samples, which would make
@@ -1537,7 +1515,7 @@ pub(crate) mod codecs {
             None,
         );
         let _ = jbig2; // the standalone --jbig2 candidate still competes
-        Ok((bg_jpeg, (bw, bh), fg, mask_bytes, codec, global))
+        Ok((bg.to_vec(), (1, 1), fg, mask_bytes, codec, global))
     }
 }
 
@@ -1847,9 +1825,13 @@ pub(crate) fn apply_mrc_rewrites(doc: &mut Document, sites: &[MrcSite], fg_objec
         let Ok(mut content) = Content::decode(&data) else {
             continue;
         };
-        // Collect (op index, ctm) per site: the op list indices are
+        // Collect (op index, name) per site: the op list indices are
         // processed in reverse so insertions do not shift earlier indices.
-        let mut inject: Vec<(usize, [f64; 6], Vec<u8>)> = Vec::new();
+        // (The CTM is deliberately *not* recorded: the foreground is drawn
+        // at whatever transform is current right after the source `Do`,
+        // which is exactly the transform the stack re-derives here — see
+        // the injection below.)
+        let mut inject: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut stack: Vec<[f64; 6]> = vec![[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
         let mut target_names: Vec<Vec<u8>> = Vec::new();
         for site in &stream_sites {
@@ -1879,9 +1861,8 @@ pub(crate) fn apply_mrc_rewrites(doc: &mut Document, sites: &[MrcSite], fg_objec
                 "Do" => {
                     if let Some(Object::Name(name)) = op.operands.first()
                         && target_names.iter().any(|n| n == name)
-                        && let Some(&ctm) = stack.last()
                     {
-                        inject.push((i, ctm, name.clone()));
+                        inject.push((i, name.clone()));
                     }
                 }
                 _ => {}
@@ -1906,14 +1887,21 @@ pub(crate) fn apply_mrc_rewrites(doc: &mut Document, sites: &[MrcSite], fg_objec
             }
             n
         };
-        for (i, ctm, _name) in inject.into_iter().rev() {
+        // Inject the foreground draw immediately after the source image's
+        // `Do` — *without* a `cm`. The source image's own `cm` is still
+        // active at that point, so the current CTM is already the placement
+        // transform recorded by the stack walk above; re-emitting it as a
+        // concatenated `cm` would multiply the scale onto itself (a
+        // 1600×1200 placement becomes 2,560,000×1,440,000), and poppler's
+        // Splash soft-mask path then overflows its `int`-based mask
+        // allocation — printing "Bogus memory allocation size" and
+        // silently dropping the foreground (mutool/ghostscript degrade
+        // differently but just as wrongly). The `q`/`Q` pair keeps the
+        // composite from leaking graphics state either way.
+        for (i, _name) in inject.into_iter().rev() {
             let fg_draw = Content {
                 operations: vec![
                     Operation::new("q", vec![]),
-                    Operation::new(
-                        "cm",
-                        ctm.into_iter().map(|v| Object::Real(v as f32)).collect(),
-                    ),
                     Operation::new("Do", vec![Object::Name(fg_name.clone())]),
                     Operation::new("Q", vec![]),
                 ],

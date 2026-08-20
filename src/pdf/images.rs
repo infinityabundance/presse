@@ -420,6 +420,13 @@ pub fn compress_images_opt<T: ImageTranscoder>(
                 sites,
             } => {
                 let mut ms = Stream::new(dictionary! {}, mask);
+                // Type/Subtype are required by Ghostscript: a soft-mask
+                // stream without them is silently dropped (the whole
+                // foreground vanishes) — verified with the identical file
+                // with and without these two keys; poppler and mutool
+                // accept either form.
+                ms.dict.set(b"Type", Object::Name(b"XObject".to_vec()));
+                ms.dict.set(b"Subtype", Object::Name(b"Image".to_vec()));
                 ms.dict
                     .set(b"ColorSpace", Object::Name(b"DeviceGray".to_vec()));
                 ms.dict.set(b"BitsPerComponent", Object::Integer(1));
@@ -654,16 +661,16 @@ impl Jbig2Candidate {
 }
 
 /// A mixed-raster (MRC) composite candidate (`--mrc`, `optimize` feature):
-/// a downsampled JPEG background, a solid-color foreground layer, and a
+/// a flat paper-color background, a solid-color foreground layer, and a
 /// high-resolution lossless mask composited as the foreground's `/SMask`.
 /// This is the representation commercial scan compressors use; the
 /// candidate self-gates on the size court against the source and the plain
 /// JPEG.
 #[cfg(feature = "optimize")]
 struct MrcCandidate {
-    /// Background JPEG bytes (ink painted out, downsampled).
+    /// Background bytes: the solid paper color (median paper RGB, 3 bytes).
     bg: Vec<u8>,
-    /// Downsampled background dimensions.
+    /// Background dimensions — always 1×1 for the flat paper layer.
     bg_w: u32,
     bg_h: u32,
     /// Solid foreground color (median ink color), RGB.
@@ -1195,7 +1202,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
                         },
                     );
                 }
-                // MRC: the commercial-scan representation — downsampled JPEG
+                // MRC: the commercial-scan representation — flat paper-color
                 // background, solid ink-color foreground composited through a
                 // high-res lossless mask (its /SMask). Offered only when the
                 // content scan found a draw site and nothing blocks the
@@ -1212,16 +1219,14 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 {
                     // The layer builder works in RGB; a grayscale source is
                     // expanded by triplicating its samples (same pixels, so
-                    // the background JPEG and the ink median are unchanged).
+                    // the background fill and the ink median are unchanged).
                     let mrc_rgb: std::borrow::Cow<'_, [u8]> = if tag == 1 {
                         std::borrow::Cow::Owned(key_bytes.iter().flat_map(|&v| [v, v, v]).collect())
                     } else {
                         std::borrow::Cow::Borrowed(key_bytes)
                     };
                     if let Ok((bg, (bw, bh), fg, mask, codec, global)) =
-                        crate::pdf::optimize::codecs::mrc_layers(
-                            &mrc_rgb, ew, eh, m, quality, jbig2, transcoder,
-                        )
+                        crate::pdf::optimize::codecs::mrc_layers(&mrc_rgb, ew, eh, m, jbig2)
                     {
                         let c = MrcCandidate {
                             bg,
@@ -1446,13 +1451,18 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 candidate.bg.len(),
                 candidate.mask.len()
             );
-            // The stream becomes the MRC *background* layer (downsampled
-            // JPEG, ink painted out). Phase 3 adds the foreground + mask
-            // objects and rewrites the content streams.
+            // The stream becomes the MRC *background* layer: a 1×1 solid
+            // image of the median paper color (a flat fill — never a JPEG,
+            // whose near-flat bitstreams poppler and Ghostscript mis-decode
+            // as a full-page gradient). Phase 3 adds the foreground + mask
+            // objects and rewrites the content streams — the rewrite emits
+            // the foreground draw without a `cm` (the source image's own
+            // transform is still current there; re-emitting it would square
+            // the scale and poppler's soft-mask allocator would overflow on
+            // the "Bogus memory allocation size" path).
             let mut bg = Stream::new(dictionary! {}, candidate.bg);
             bg.dict.set(b"Type", Object::Name(b"XObject".to_vec()));
             bg.dict.set(b"Subtype", Object::Name(b"Image".to_vec()));
-            bg.dict.set(b"Filter", Object::Name(b"DCTDecode".to_vec()));
             bg.dict
                 .set(b"ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
             bg.dict.set(b"BitsPerComponent", Object::Integer(8));

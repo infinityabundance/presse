@@ -442,21 +442,23 @@ Measured on the synthetic corpus (deterministic, best-of-1):
 
 | corpus file | default (`fast`) | `--mrc` | `--jbig2` | `--compression smallest` |
 |---|---|---|---|---|
-| scanned.pdf (3.40 MB, 3 grainy gray pages) | 0.73 MB | 0.28 MB | 1.3 KB | 1.1 KB |
+| scanned.pdf (3.40 MB, 3 grainy gray pages) | 0.26 MB | 2.3 KB | 1.3 KB | 1.1 KB |
 | image-heavy.pdf (17.98 MB, 60 photos) | ~4.8 MB | — | — | 2.59 MB |
 
 Readings and honest caveats:
 
 - The **scanned** row shows the three bitonal regimes: `fast` pays
-  photographic cost for document content (0.73 MB), `--mrc` keeps the
-  paper grain in a downsampled background while the text lives in a
-  lossless G4 mask (0.28 MB, mean luma diff ~3.5 vs the source at 30 dpi,
-  visually the closest of the three to the original), and `--jbig2` /
-  `smallest` collapse the page to a flat 1-bit mask (~1 KB, pixel-identical
-  to the equivalent `--raster-classify` G4 output — the grain is gone, as
-  with any bitonal representation). The size court picks the smallest per
-  image, so on real scans the winner depends on how much paper texture is
-  worth keeping.
+  photographic cost for document content (0.26 MB), `--mrc` keeps the
+  paper color as a flat 1×1 fill while the text lives in a lossless G4
+  mask (2.3 KB, mean luma diff 1.6 vs the source at 30 dpi, visually the
+  closest of the three to the original — the earlier downsampled-JPEG
+  background was dropped because near-flat JPEG bitstreams are
+  mis-decoded as full-page gradients by poppler and Ghostscript), and
+  `--jbig2` / `smallest` collapse the page to a flat 1-bit mask (~1 KB,
+  pixel-identical to the equivalent `--raster-classify` G4 output — the
+  grain is gone, as with any bitonal representation). The size court
+  picks the smallest per image, so on real scans the winner depends on
+  how much paper texture is worth keeping.
 - **`--jpeg2000`** re-encodes the 60-photo corpus to ~2.6 MB (the same
   order as `--jpeg2000` alone: 2.59 MB) at a mean luma difference of
   ~1.3 levels vs the source on sampled pages — visually equivalent, but
@@ -480,9 +482,14 @@ Readings and honest caveats:
   decoder emits *inverted* samples (so JBIG2 images use the identity
   `/Decode`, the opposite of G4's `[1 0]`), its JBIG2 parser warns
   "extraneous byte after segment" on the encoder's spec-mandated A.3.6
-  flush marker (non-fatal, output correct), and its Splash renderer prints
-  "Bogus memory allocation size" on large full-bleed masked images
-  (mutool/gs render the same files cleanly and poppler's output is still
-  pixel-accurate). These are renderer quirks, not presse defects — each is
-  documented next to the code that works around it.
+  flush marker (non-fatal, output correct), and its Splash soft-mask path
+  overflowed its `int`-based mask allocation ("Bogus memory allocation
+  size") whenever the MRC content rewrite re-applied the placement `cm`
+  for the foreground — squaring the scale (1600×1200 became
+  2,560,000×1,440,000). The rewrite now draws the foreground at the
+  already-current transform, and Ghostscript additionally requires the
+  soft mask to be a typed `/Subtype /Image` XObject or it silently drops
+  it; both are fixed and rendered pixel-identically across
+  poppler/mutool/gs. These are renderer quirks, not presse defects — each
+  is documented next to the code that works around it.
 

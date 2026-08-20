@@ -246,8 +246,8 @@ Default (flag omitted): JPEG-only pipeline, current behavior."
             long,
             default_value_t = false,
             long_help = "For classified bitonal scans, build a real MRC composite instead of
-  a flat 1-bit image: a heavily downsampled JPEG background (text inked
-  out with the median paper color), a high-resolution lossless CCITT G4
+  a flat 1-bit image: a solid paper-color background (the median paper
+  color, emitted as a 1×1 image), a high-resolution lossless CCITT G4
   mask, and a solid foreground color layer composited with the mask as
   its /SMask — the representation commercial scan compressors
   (ABBYY/LEADTOOLS/Pdftools) use. The page content is rewritten to draw

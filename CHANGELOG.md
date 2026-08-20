@@ -77,11 +77,19 @@ All notable changes to this project will be documented in this file.
   the JPEG candidate's bytes so it wins only when genuinely smaller at
   comparable rate.
 - **`--mrc`** (`optimize` feature, off by default) — the mixed-raster
-  composite commercial scan compressors use: heavily downsampled JPEG
-  background (ink painted out), solid ink-color foreground composited
-  through a high-resolution lossless CCITT G4 mask as its `/SMask`, with
-  the content streams rewritten to draw background then foreground at the
-  captured CTM. This is the intended home for mask compositing (the
+  composite commercial scan compressors use: a solid paper-color
+  background (the median paper color, emitted as a 1×1 image — never a
+  JPEG, since near-flat JPEG bitstreams are mis-decoded as full-page
+  gradients by poppler and Ghostscript), solid ink-color foreground
+  composited through a high-resolution lossless CCITT G4 mask as its
+  `/SMask` (a full image XObject — Ghostscript silently drops a soft mask
+  without `/Type /XObject` + `/Subtype /Image`), with the content streams
+  rewritten to draw background then foreground *without* re-applying the
+  placement `cm` (the source image's transform is already current there;
+  re-emitting it squares the scale and made poppler's soft-mask allocator
+  overflow — the "Bogus memory allocation size" notice, now fixed and
+  pixel-verified identical across poppler/mutool/ghostscript). This is the
+  intended home for mask compositing (the
   graphics state is under presse's control, so the composite cannot leak
   background or recolor ink — regression-tested pixel-identically under a
   blue rectangle with a red current color). The mask is always G4:

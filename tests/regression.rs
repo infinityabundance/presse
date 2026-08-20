@@ -2902,24 +2902,36 @@ fn mrc_composite_is_opaque_over_colored_background() {
     build(&dir, "mrc-g4.pdf", true, false);
     build(&dir, "mrc-post.pdf", false, true);
 
-    // The MRC composite: downsampled background + 1×1 foreground with the
-    // G4 mask as its /SMask.
+    // The MRC composite: a 1×1 paper-color background + a 1×1 foreground
+    // with the G4 mask as its /SMask. The background is deliberately a flat
+    // image, not a JPEG: near-flat JPEG bitstreams are mis-decoded as
+    // full-page gradients by poppler and Ghostscript (verified against the
+    // `image` crate, libjpeg, and PIL encoders). The mask is a full image
+    // XObject: Ghostscript silently drops a soft mask whose stream lacks
+    // /Type /XObject + /Subtype /Image (the foreground then vanishes).
     let loaded = assert_well_formed(&dir.join("mrc-post.pdf"));
     let images = find_image_streams(&loaded);
     let bg = images
         .iter()
         .find(|(_, _, d)| {
-            d.get(b"Filter").and_then(|f| f.as_name()).ok() == Some(b"DCTDecode".as_slice())
+            d.get(b"Width").and_then(|w| w.as_i64()).ok() == Some(1) && d.get(b"SMask").is_err()
         })
-        .expect("the MRC background must be a DCTDecode image");
+        .expect("the MRC background must be the 1×1 paper-color layer");
     assert_eq!(
-        bg.2.get(b"Width").and_then(|w| w.as_i64()).ok(),
-        Some(1024),
-        "the background must be the downsampled 1024-cap layer (1600 → 1024)"
+        bg.2.get(b"Filter").and_then(|f| f.as_name()).ok(),
+        None,
+        "the background must be a raw 1×1 image, never a JPEG"
+    );
+    assert_eq!(
+        bg.2.get(b"ColorSpace").and_then(|c| c.as_name()).ok(),
+        Some(b"DeviceRGB".as_slice()),
+        "the background must be DeviceRGB"
     );
     let fg = images
         .iter()
-        .find(|(_, _, d)| d.get(b"Width").and_then(|w| w.as_i64()).ok() == Some(1))
+        .find(|(_, _, d)| {
+            d.get(b"Width").and_then(|w| w.as_i64()).ok() == Some(1) && d.get(b"SMask").is_ok()
+        })
         .expect("the MRC foreground must be the 1×1 solid-color layer");
     let smask = fg.2.get(b"SMask").unwrap().as_reference().unwrap();
     let Object::Stream(mask) = loaded.objects.get(&smask).unwrap() else {
@@ -2942,18 +2954,59 @@ fn mrc_composite_is_opaque_over_colored_background() {
         }
         _ => panic!("SMask must carry the identity /Decode"),
     }
-    assert_eq!(images.len(), 2, "background + foreground layers only");
-    // The content rewrite must have injected the foreground draw.
-    let content_has_fg = loaded.objects.values().any(|obj| match obj {
+    assert_eq!(
+        mask.dict.get(b"Type").and_then(|t| t.as_name()).ok(),
+        Some(b"XObject".as_slice()),
+        "the SMask must be a typed XObject (Ghostscript drops untyped soft masks)"
+    );
+    assert_eq!(
+        mask.dict.get(b"Subtype").and_then(|t| t.as_name()).ok(),
+        Some(b"Image".as_slice()),
+        "the SMask must be an Image XObject (Ghostscript drops it otherwise)"
+    );
+    // bg + fg + the mask itself: the mask is a full image XObject (its
+    // /Subtype /Image is what makes Ghostscript honor the soft mask at all).
+    assert_eq!(
+        images.len(),
+        3,
+        "background + foreground + mask layers only"
+    );
+    // The rewrite must inject the foreground draw *without* re-applying
+    // `cm`: the source image's own transform is still current at the
+    // injection point, so a second `cm` would square the scale (a 1600×1200
+    // placement becomes 2,560,000×1,440,000) and poppler's soft-mask
+    // allocator would overflow on the "Bogus memory allocation size" path,
+    // silently dropping the foreground. The op immediately before the
+    // foreground `Do` must be `q`, with no `cm` inside the injected segment.
+    let fg_draws_without_cm = loaded.objects.values().any(|obj| match obj {
         Object::Stream(s) => s
             .decompressed_content()
             .ok()
-            .is_some_and(|c| c.windows(6).any(|w| w == b"FgMrc0")),
+            .and_then(|c| Content::decode(&c).ok())
+            .is_some_and(|content| {
+                content
+                    .operations
+                    .iter()
+                    .position(|op| {
+                        op.operator == "Do"
+                            && matches!(
+                                op.operands.first(),
+                                Some(Object::Name(n)) if n == b"FgMrc0"
+                            )
+                    })
+                    .is_some_and(|do_idx| {
+                        do_idx > 0
+                            && content.operations[do_idx - 1].operator == "q"
+                            && !content.operations[do_idx - 1..=do_idx]
+                                .iter()
+                                .any(|op| op.operator == "cm")
+                    })
+            }),
         _ => false,
     });
     assert!(
-        content_has_fg,
-        "the content stream must draw the foreground layer"
+        fg_draws_without_cm,
+        "the content stream must draw the foreground layer without re-applying `cm`"
     );
 
     // The brutal assertions under the same blue rectangle + red current
