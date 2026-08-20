@@ -458,7 +458,13 @@ pub(crate) fn encode_jpeg_420(
 /// content bytes, never on a hash alone: the map may hash the key for
 /// placement, but a hash collision can never substitute one image's JPEG for
 /// another's.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// The `Hash` impl is deliberately bounded ([`HASH_PREFIX_BYTES`] +
+/// [`HASH_SUFFIX_BYTES`] of the content, plus the length) so a cache lookup
+/// never hashes a whole multi-MB scan: the common case (a unique image)
+/// pays a few KiB of hashing instead of the full payload, and equality
+/// short-circuits on the length before touching bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheKey {
     /// Target quality.
     quality: u8,
@@ -471,6 +477,31 @@ pub(crate) struct CacheKey {
     height: u32,
     /// Exact encoder-input bytes (content identity).
     content: Arc<[u8]>,
+}
+
+/// Bytes of the content slice fed to the key hash — the fast-reject bound.
+/// Both ends are hashed because JPEG streams share identical SOI / marker /
+/// table prefixes (and EOI suffixes) for same-encoder, same-quality output,
+/// so a single prefix would cluster every such image into one bucket.
+const HASH_PREFIX_BYTES: usize = 4096;
+const HASH_SUFFIX_BYTES: usize = 4096;
+
+impl std::hash::Hash for CacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.quality.hash(state);
+        self.kind.hash(state);
+        self.width.hash(state);
+        self.height.hash(state);
+        let bytes = &*self.content;
+        let n = bytes.len();
+        n.hash(state);
+        if n <= HASH_PREFIX_BYTES + HASH_SUFFIX_BYTES {
+            bytes.hash(state);
+        } else {
+            bytes[..HASH_PREFIX_BYTES].hash(state);
+            bytes[n - HASH_SUFFIX_BYTES..].hash(state);
+        }
+    }
 }
 
 /// Build a [`CacheKey`] for one transcode request.
@@ -541,7 +572,8 @@ mod tests {
     use super::encode_jpeg;
     use super::encode_jpeg_420;
     use super::jpeg_components;
-    use super::{TranscodeCache, TranscodeError, encode_key};
+    use super::{CacheKey, TranscodeCache, TranscodeError, encode_key};
+    use std::hash::Hash;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -662,6 +694,67 @@ mod tests {
             encode_key(50, 3, 4, 3, &bytes),
             encode_key(50, 3, 4, 3, &other)
         );
+    }
+
+    /// A `Hasher` that counts the bytes fed to it, to pin the bounded-hash
+    /// fast-reject: hashing a large key must not touch the whole payload.
+    #[derive(Default)]
+    struct CountingHasher {
+        bytes: usize,
+    }
+
+    impl std::hash::Hasher for CountingHasher {
+        fn finish(&self) -> u64 {
+            self.bytes as u64
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.bytes += bytes.len();
+        }
+    }
+
+    fn hash_cost(key: &CacheKey) -> usize {
+        let mut h = CountingHasher::default();
+        key.hash(&mut h);
+        h.bytes
+    }
+
+    #[test]
+    fn cache_key_hash_is_bounded_to_prefix_and_suffix() {
+        use super::{HASH_PREFIX_BYTES, HASH_SUFFIX_BYTES};
+        // A 28 MB payload must hash only the bounded window (both ends), not
+        // the whole scan.
+        let big = vec![0xA5u8; 28 * 1024 * 1024];
+        let cost = hash_cost(&encode_key(50, 2, 4000, 2800, &big));
+        assert!(
+            cost <= HASH_PREFIX_BYTES + HASH_SUFFIX_BYTES + 64,
+            "hashing a 28 MB key must be bounded: {cost} bytes hashed"
+        );
+
+        // A small payload is hashed in full (nothing to bound).
+        let small = vec![0xA5u8; 100];
+        assert!(hash_cost(&encode_key(50, 3, 10, 10, &small)) >= 100);
+    }
+
+    #[test]
+    fn cache_key_middle_bytes_still_distinguish_keys() {
+        // The bounded hash must not create false dedup: two keys that share
+        // the same 4 KiB prefix and suffix but differ in the middle are
+        // different images and must produce different results through the
+        // cache (equality is on the exact bytes, so they land in distinct
+        // entries even if the hash collides).
+        let mut a = vec![0x11u8; 100_000];
+        let mut b = vec![0x11u8; 100_000];
+        a[50_000] = 0x01;
+        b[50_000] = 0x02;
+        let ka = encode_key(50, 2, 400, 250, &a);
+        let kb = encode_key(50, 2, 400, 250, &b);
+        assert_ne!(ka, kb, "different middle bytes must not be equal");
+
+        let cache = TranscodeCache::new();
+        let ra = cache.get(ka, || Ok(vec![1]));
+        let rb = cache.get(kb, || Ok(vec![2]));
+        assert_eq!(ra.as_ref().as_deref().unwrap(), &[1][..]);
+        assert_eq!(rb.as_ref().as_deref().unwrap(), &[2][..]);
     }
 
     #[test]

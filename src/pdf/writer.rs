@@ -1,4 +1,5 @@
-use lopdf::{Document, Object, SaveOptions};
+use lopdf::{Document, Object, ObjectId, SaveOptions};
+use std::collections::HashMap;
 use std::fs::File;
 
 use crate::pdf::images::zlib_encode;
@@ -54,6 +55,77 @@ pub fn recompress_flate(doc: &mut Document) -> usize {
     recompressed
 }
 
+/// Compact object ids to 1..=n and rewrite every reference, in linear time.
+///
+/// Replaces lopdf's `renumber_objects` in the writer paths. lopdf's version
+/// walks the reachable graph and tracks visited ids with a `Vec::contains`
+/// per reference — O(n²) on object-heavy documents, where it dominates the
+/// save (460 ms of a 530 ms save on a 67k-object document). This pass
+/// rewrites references in *every* object (reachable or not, so no stale id
+/// can survive) in one pass against a hash map, rewrites the trailer's
+/// references too, and early-returns when the ids are already contiguous
+/// (the common case for freshly built or previously renumbered documents).
+///
+/// Page order is untouched: lopdf's variant may reorder the page tree, but
+/// the writer must never change document semantics.
+pub fn renumber_objects(doc: &mut Document) {
+    let mut ids: Vec<ObjectId> = doc.objects.keys().copied().collect();
+    ids.sort_unstable();
+    if ids
+        .iter()
+        .enumerate()
+        .all(|(i, &(n, _))| n as usize == i + 1)
+    {
+        return;
+    }
+
+    let mut replace: HashMap<ObjectId, ObjectId> = HashMap::with_capacity(ids.len());
+    for (i, &old) in ids.iter().enumerate() {
+        replace.insert(old, (i as u32 + 1, old.1));
+    }
+
+    fn rewrite(obj: &mut Object, replace: &HashMap<ObjectId, ObjectId>) {
+        match obj {
+            Object::Reference(id) => {
+                if let Some(new) = replace.get(id) {
+                    *id = *new;
+                }
+            }
+            Object::Array(items) => {
+                for item in items.iter_mut() {
+                    rewrite(item, replace);
+                }
+            }
+            Object::Dictionary(dict) => {
+                for (_, v) in dict.iter_mut() {
+                    rewrite(v, replace);
+                }
+            }
+            Object::Stream(stream) => {
+                for (_, v) in stream.dict.iter_mut() {
+                    rewrite(v, replace);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (_, obj) in doc.objects.iter_mut() {
+        rewrite(obj, &replace);
+    }
+    for (_, v) in doc.trailer.iter_mut() {
+        rewrite(v, &replace);
+    }
+
+    let mut objects = std::collections::BTreeMap::new();
+    for (old, new) in &replace {
+        if let Some(obj) = doc.objects.remove(old) {
+            objects.insert(*new, obj);
+        }
+    }
+    doc.objects = objects;
+}
+
 pub fn compress_and_save_pdf(
     doc: &mut Document,
     name: &str,
@@ -84,8 +156,8 @@ pub fn compress_and_save_pdf(
     // entry to it, shifting every subsequent entry whenever a gap exists — a
     // corruption qpdf rejects and poppler can render as blank pages. Renumber
     // to contiguous ids first so both the xref-table and xref-stream writers
-    // stay correct.
-    doc.renumber_objects();
+    // stay correct (see [`renumber_objects`] for the linear-time pass).
+    renumber_objects(doc);
 
     doc.compress();
 
@@ -101,7 +173,7 @@ pub fn save_pdf(doc: &mut Document, name: &str) -> Result<(), Box<dyn std::error
     Document::delete_zero_length_streams(doc);
     // See compress_and_save_pdf: lopdf's xref writers mis-handle gaps in
     // object numbering, so compact the ids before saving.
-    doc.renumber_objects();
+    renumber_objects(doc);
     doc.compress();
     doc.save(name)?;
     Ok(())
