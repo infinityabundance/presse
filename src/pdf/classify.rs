@@ -23,7 +23,7 @@
 //! representation drops color and anti-aliasing. The routing is:
 //!
 //! ```text
-//! BitonalText   -> 1-bit CCITT G4 mask (/ImageMask)
+//! BitonalText   -> 1-bit CCITT G4 opaque DeviceGray image
 //! FlatColor     -> /Indexed palette (reuses the --palette candidate)
 //! Photo/Mixed   -> JPEG (current path; the within-image split of
 //!                  MixedDocument into mask + continuous-tone layers is

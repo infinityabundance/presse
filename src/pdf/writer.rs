@@ -66,6 +66,19 @@ pub fn recompress_flate(doc: &mut Document) -> usize {
 /// references too, and early-returns when the ids are already contiguous
 /// (the common case for freshly built or previously renumbered documents).
 ///
+/// Invariants kept with lopdf's own renumberer:
+/// - **`max_id`** is repaired to the largest surviving object id in *both*
+///   paths (contiguous ids can still leave a stale high `max_id` behind
+///   from deleted objects). lopdf's writer sizes its xref and allocates
+///   object-stream / cross-reference-stream ids from `max_id`; a stale low
+///   value would collide with existing ids, a stale high one inflate
+///   `/Size`.
+/// - **bookmarks** are re-pointed when object ids move, matching lopdf's
+///   `renumber_bookmarks` (the `Document::bookmarks`/`bookmark_table` the
+///   `merge` path populates and `build_outline` reads). Outline *objects*
+///   in the tree are rewritten like any other reference; the table keeps
+///   `build_outline`'s later reads consistent.
+///
 /// Page order is untouched: lopdf's variant may reorder the page tree, but
 /// the writer must never change document semantics.
 pub fn renumber_objects(doc: &mut Document) {
@@ -76,6 +89,9 @@ pub fn renumber_objects(doc: &mut Document) {
         .enumerate()
         .all(|(i, &(n, _))| n as usize == i + 1)
     {
+        // Already contiguous — but a stale historical `max_id` (from
+        // deleted objects) must still be repaired.
+        doc.max_id = ids.last().map(|&(n, _)| n).unwrap_or(0);
         return;
     }
 
@@ -117,6 +133,15 @@ pub fn renumber_objects(doc: &mut Document) {
         rewrite(v, &replace);
     }
 
+    // Keep the outline/bookmark bookkeeping consistent when ids move (the
+    // `merge` path populates `bookmarks`/`bookmark_table` and `build_outline`
+    // reads them after renumbering).
+    for (&old, &new) in &replace {
+        if old != new {
+            doc.renumber_bookmarks(&old, &new);
+        }
+    }
+
     let mut objects = std::collections::BTreeMap::new();
     for (old, new) in &replace {
         if let Some(obj) = doc.objects.remove(old) {
@@ -124,6 +149,7 @@ pub fn renumber_objects(doc: &mut Document) {
         }
     }
     doc.objects = objects;
+    doc.max_id = doc.objects.keys().map(|(id, _)| *id).max().unwrap_or(0);
 }
 
 pub fn compress_and_save_pdf(

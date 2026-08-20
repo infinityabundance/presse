@@ -3,12 +3,16 @@
 //! **Design rationale.** A scanned page stored as one RGB raster is usually
 //! not a photograph — it is text and rules on paper. The `--raster-classify`
 //! path detects genuinely bitonal content and stores it as a 1-bit
-//! `/ImageMask` XObject instead of a photographic JPEG. The mask needs a
-//! codec that exploits bilevel structure; CCITT Group 4 (T.6) is the
-//! standard document codec — every PDF viewer and ghostscript decode it
-//! natively, it needs no dependency (unlike JBIG2, which would want a
-//! symbol-dictionary codec), and for text masks it compresses several times
-//! smaller than Flate of the packed bits.
+//! `DeviceGray` CCITT G4 image instead of a photographic JPEG. (Not an
+//! `/ImageMask` stencil: a stencil's 0 bits are transparent and its ink
+//! inherits the current color, so it cannot substitute for an opaque
+//! black-on-white raster — see the opaque-image regression in
+//! `tests/regression.rs`.) The 1-bit image needs a codec that exploits
+//! bilevel structure; CCITT Group 4 (T.6) is the standard document codec —
+//! every PDF viewer and ghostscript decode it natively, it needs no
+//! dependency (unlike JBIG2, which would want a symbol-dictionary codec),
+//! and for text masks it compresses several times smaller than Flate of
+//! the packed bits.
 //!
 //! The implementation follows the ITU-T T.4/T.6 run-length and 2D mode
 //! tables (transcribed from the public spec data; the `fax` crate's
@@ -18,10 +22,13 @@
 //! tracking. Output is a plain G4 stream terminated by EOFB (two EOLs), the
 //! exact form the `/CCITTFaxDecode /K -1` decoder expects.
 //!
-//! Losslessness is the court: the encoder is deterministic and the mask is
-//! decoded bit-exactly by viewers — the regression twin-render test pins
-//! this by rasterizing the same mask stored as both raw 1-bit Flate and G4
-//! and asserting pixel-identical output.
+//! Losslessness is the court — of the G4 encoding: the encoder is
+//! deterministic and the 1-bit payload is decoded bit-exactly by viewers
+//! (the regression twin-render test pins this by rasterizing the same mask
+//! stored as both raw 1-bit Flate and G4 and asserting pixel-identical
+//! output). The earlier RGB→bitonal conversion performed by the classifier
+//! is itself lossy, which is why the classifier only fires on near-perfect
+//! black-and-white content.
 
 /// A bit pattern: `bits` holds `len` bits, MSB-first.
 type Code = (u32, u8);

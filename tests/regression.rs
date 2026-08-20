@@ -19,7 +19,7 @@ use image::GrayImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
 use presse::pdf::images::{QualityMode, compress_images, compress_images_with};
-use presse::pdf::writer::{compress_and_save_pdf, recompress_flate, save_pdf};
+use presse::pdf::writer::{compress_and_save_pdf, recompress_flate, renumber_objects, save_pdf};
 use presse::transcode::{
     Acceleration, CpuTranscoder, FallbackTranscoder, ImageTranscoder, Input, RuntimeTranscoder,
     TranscodeError, resolve,
@@ -2046,7 +2046,6 @@ fn press_cli_jpeg_encoder_flag() {
     assert_visual_similarity(&dir, "je-cli", 0.90);
 }
 
-
 /// CCITT Group 4 encoder correctness, pinned through poppler: the same
 /// 1-bit mask stored as raw 1-bit `FlateDecode` and as `CCITTFaxDecode`
 /// (K = −1) must render *pixel-identically*. Both `/ImageMask` stencils
@@ -2087,7 +2086,7 @@ fn ccitt_g4_mask_decodes_identically_to_raw_1bit() {
             "Subtype" => "Image",
             "Width" => w as i64,
             "Height" => h as i64,
-            "ImageMask" => true,
+            "ColorSpace" => "DeviceGray",
             "BitsPerComponent" => 1,
             "Filter" => filter,
             "Decode" => vec![1.into(), 0.into()],
@@ -2171,8 +2170,8 @@ fn ccitt_g4_mask_decodes_identically_to_raw_1bit() {
 }
 
 /// `--raster-classify` end-to-end: a bitonal-text RGB page becomes a 1-bit
-/// CCITT G4 `/ImageMask` (far smaller, still renders as black-on-white),
-/// while a photographic image on the same run stays JPEG.
+/// CCITT G4 opaque `DeviceGray` image (far smaller, still renders as
+/// black-on-white), while a photographic image on the same run stays JPEG.
 #[test]
 fn raster_classify_masks_bitonal_text_and_keeps_photos_jpeg() {
     let dir = test_dir();
@@ -2216,22 +2215,33 @@ fn raster_classify_masks_bitonal_text_and_keeps_photos_jpeg() {
     let mut masks = 0;
     let mut jpegs = 0;
     for (_, content, dict) in &images {
-        if dict.get(b"ImageMask").and_then(|m| m.as_bool()).ok() == Some(true) {
+        let is_g4 = dict.get(b"Filter").and_then(|f| f.as_name()).ok()
+            == Some(b"CCITTFaxDecode".as_slice());
+        if is_g4 {
             masks += 1;
             assert_eq!(
-                dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
-                Some(b"CCITTFaxDecode".as_slice()),
-                "bitonal text must become a CCITT G4 mask"
-            );
-            assert_eq!(
                 dict.get(b"BitsPerComponent").and_then(|b| b.as_i64()).ok(),
-                Some(1)
+                Some(1),
+                "bitonal text must become a 1-bit CCITT G4 image"
+            );
+            // An *opaque* DeviceGray image, never an /ImageMask stencil
+            // (a stencil's 0 bits are transparent and its ink inherits the
+            // current color — not a substitute for an opaque raster).
+            assert_eq!(
+                dict.get(b"ColorSpace").and_then(|c| c.as_name()).ok(),
+                Some(b"DeviceGray".as_slice()),
+                "bitonal G4 must be an opaque DeviceGray image"
             );
             assert!(
-                dict.get(b"ColorSpace").is_err(),
-                "masks have no /ColorSpace"
+                dict.get(b"ImageMask").is_err(),
+                "bitonal G4 must not be an /ImageMask stencil"
             );
-            assert!(content.len() < 4 * 1024, "G4 mask must be tiny");
+            assert_eq!(
+                dict.get(b"Decode").and_then(|d| d.as_array()).ok(),
+                Some(&vec![1.into(), 0.into()]),
+                "G4 ink (1, BlackIs1) must decode to black, paper to white"
+            );
+            assert!(content.len() < 4 * 1024, "G4 image must be tiny");
         } else {
             jpegs += 1;
             assert!(is_dct_filter(dict), "photo must stay a DCT stream");
@@ -2245,6 +2255,221 @@ fn raster_classify_masks_bitonal_text_and_keeps_photos_jpeg() {
     add_image_page(&mut pre, pages_id, text.clone(), w, h, false);
     save_pdf(&mut pre, dir.join("classify-pre.pdf").to_str().unwrap()).unwrap();
     assert_visual_similarity(&dir, "classify", 0.85);
+}
+
+/// The mask representation is an *opaque* 1-bit image, not an `/ImageMask`
+/// stencil: a stencil paints ink in the current nonstroking color and treats
+/// 0 bits as transparent, so dropping it over a colored background would let
+/// the background show through the "white" paper and recolor the text. This
+/// brutal fixture puts a blue rectangle beneath the source raster and sets a
+/// red nonstroking color before `Do` — with a correct opaque replacement the
+/// pre/post renders must be *pixel-identical*.
+#[test]
+fn raster_classify_mask_is_opaque_over_colored_background() {
+    let dir = test_dir();
+    if !ensure_tool("pdftoppm", pdftoppm_available()) {
+        return;
+    }
+    // Bitonal text-like RGB raster: black strokes on white (even dims so the
+    // even-aligned G4 image has identical geometry).
+    let (w, h) = (320u32, 240u32);
+    let mut text = vec![255u8; (w * h * 3) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            if (x / 24) % 3 == 0 && y % 9 < 5 {
+                let p = ((y * w + x) * 3) as usize;
+                text[p] = 0;
+                text[p + 1] = 0;
+                text[p + 2] = 0;
+            }
+        }
+    }
+
+    let build = |dir: &std::path::Path, name: &str, compress: bool| {
+        let (mut doc, pages_id) = new_doc();
+        let mut image_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "BitsPerComponent" => 8,
+        };
+        image_dict.set("ColorSpace", "DeviceRGB");
+        let mut image_stream = Stream::new(image_dict, text.clone());
+        image_stream.compress().unwrap();
+        let image_id = doc.add_object(image_stream);
+
+        // Blue page, red current nonstroking color, then the raster on top.
+        let content = Content {
+            operations: vec![
+                Operation::new("rg", vec![0.0.into(), 0.0.into(), 1.0.into()]),
+                Operation::new("re", vec![0.into(), 0.into(), 612.into(), 792.into()]),
+                Operation::new("f", vec![]),
+                Operation::new("rg", vec![1.0.into(), 0.0.into(), 0.0.into()]),
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![w.into(), 0.into(), 0.into(), h.into(), 50.into(), 50.into()],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+        });
+        push_kid(&mut doc, pages_id, page_id);
+        if compress {
+            compress_images_with(
+                &mut doc,
+                QualityMode::fixed(QUALITY),
+                false,
+                &CpuTranscoder::default(),
+                None,
+                false,
+                true,
+            );
+        }
+        save_pdf(&mut doc, dir.join(name).to_str().unwrap()).unwrap();
+    };
+
+    build(&dir, "opaque-pre.pdf", false);
+    build(&dir, "opaque-post.pdf", true);
+
+    // The compressed image must be the opaque DeviceGray representation.
+    let loaded = assert_well_formed(&dir.join("opaque-post.pdf"));
+    let images = find_image_streams(&loaded);
+    assert_eq!(images.len(), 1);
+    let (_, _, dict) = &images[0];
+    assert_eq!(
+        dict.get(b"Filter").and_then(|f| f.as_name()).ok(),
+        Some(b"CCITTFaxDecode".as_slice())
+    );
+    assert_eq!(
+        dict.get(b"ColorSpace").and_then(|c| c.as_name()).ok(),
+        Some(b"DeviceGray".as_slice()),
+        "bitonal G4 must be an opaque DeviceGray image"
+    );
+    assert!(
+        dict.get(b"ImageMask").is_err(),
+        "bitonal G4 must not be an /ImageMask stencil"
+    );
+
+    // Pixel-identical: the white paper must stay opaque (covering the blue
+    // rectangle) and the ink must stay black (ignoring the red color).
+    let (pre, post) = (dir.join("opaque-pre"), dir.join("opaque-post"));
+    assert!(
+        render_first_page(&dir.join("opaque-pre.pdf"), &pre),
+        "pdftoppm failed on opaque-pre.pdf"
+    );
+    assert!(
+        render_first_page(&dir.join("opaque-post.pdf"), &post),
+        "pdftoppm failed on opaque-post.pdf"
+    );
+    let a = image::open(pre.with_extension("png")).unwrap().to_luma8();
+    let b = image::open(post.with_extension("png")).unwrap().to_luma8();
+    assert_eq!(a.dimensions(), b.dimensions());
+    let diff = a
+        .pixels()
+        .zip(b.pixels())
+        .filter(|(x, y)| x[0] != y[0])
+        .count();
+    assert_eq!(
+        diff, 0,
+        "opaque G4 image must render pixel-identically to the source raster          ({diff} px differ; an /ImageMask stencil would show the blue through          the white and paint the ink red)"
+    );
+}
+
+/// The linear renumberer must keep lopdf's `max_id` invariant. lopdf's own
+/// `renumber_objects_with` ends with `max_id = new_id - 1`, and its writer
+/// sizes the xref and allocates the object-stream / cross-reference-stream
+/// ids from `max_id` — a stale value (left behind by deleted objects) would
+/// bloat or, worse, *misalign* the xref: a stale-low `max_id` drops objects
+/// past it from the xref, the exact corruption this PR eliminates. Both the
+/// contiguous early-return path and the compaction path must repair it.
+#[test]
+fn renumber_repairs_stale_max_id() {
+    let dir = test_dir();
+
+    let (mut doc, pages_id) = new_doc();
+    for page in 0..30 {
+        add_text_page(&mut doc, pages_id, page);
+    }
+    // Three orphaned objects; the middle one is deleted below to open a gap
+    // without touching the page tree.
+    for _ in 0..3 {
+        doc.add_object(Object::String(
+            b"orphan".to_vec(),
+            lopdf::StringFormat::Literal,
+        ));
+    }
+    let n = doc.objects.len() as u32;
+    assert!(n < 5000, "test document must stay small");
+    doc.max_id = 5000; // stale historical max_id (deleted objects)
+
+    // Contiguous ids 1..=n: the early-return path must still repair max_id.
+    renumber_objects(&mut doc);
+    assert_eq!(
+        doc.max_id, n,
+        "early-return path must repair max_id to the largest object id"
+    );
+
+    // Open a middle gap (delete the second orphan) → compaction path.
+    let gap_id = doc.objects.keys().copied().nth(n as usize - 2).unwrap();
+    doc.delete_object(gap_id);
+    doc.max_id = 5000; // stale again
+    renumber_objects(&mut doc);
+    let compact = doc.objects.len() as u32;
+    assert_eq!(
+        doc.max_id, compact,
+        "compaction path must repair max_id to the largest object id"
+    );
+    assert!(
+        (1..=compact).all(|id| doc.objects.contains_key(&(id, 0))),
+        "renumber must produce contiguous 1..=n ids"
+    );
+
+    // Save with object streams (writer allocates stream ids from max_id).
+    compress_and_save_pdf(
+        &mut doc,
+        dir.join("renum-maxid.pdf").to_str().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let loaded = assert_well_formed(&dir.join("renum-maxid.pdf"));
+    // Every original object must appear exactly once in the xref.
+    for id in 1..=compact {
+        let count = loaded
+            .objects
+            .keys()
+            .filter(|(i, g)| *i == id && *g == 0)
+            .count();
+        assert_eq!(count, 1, "object {id} must appear exactly once in the xref");
+    }
+    // /Size must be exactly one past the largest written object id.
+    let max_loaded = loaded.objects.keys().map(|(id, _)| *id).max().unwrap();
+    let size = loaded
+        .trailer
+        .get(b"Size")
+        .and_then(|s| s.as_i64())
+        .ok()
+        .unwrap();
+    assert_eq!(
+        size,
+        max_loaded as i64 + 1,
+        "/Size ({size}) must equal the largest written object id + 1 ({max_loaded})"
+    );
+    assert_eq!(
+        loaded.get_pages().len(),
+        30,
+        "all pages must survive renumber + save with object streams"
+    );
 }
 
 /// `--recompress-flate` end-to-end: a document whose Flate streams sit at a

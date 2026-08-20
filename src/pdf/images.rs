@@ -37,7 +37,7 @@
 //! 7. **`--raster-classify`** — opt-in representation selection (default
 //!    off): the raster classifier (`pdf::classify`) decides what each
 //!    decoded image actually *is* before the size gate runs. Bitonal
-//!    text/rules get a 1-bit CCITT G4 `/ImageMask` stencil (`pdf::fax`) —
+//!    text/rules get a 1-bit CCITT G4 opaque grayscale image (`pdf::fax`) —
 //!    the representation a document compressor should use instead of
 //!    paying photographic cost — flat-color figures get the `/Indexed`
 //!    candidate, and photos / mixed pages stay on the JPEG path. The
@@ -179,7 +179,7 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 /// additionally tries an `/Indexed` color-space candidate for eligible flat
 /// images and keeps the smallest of original / JPEG / indexed. `classify`
 /// (`--raster-classify`) runs the raster classifier first: bitonal content
-/// additionally gets a 1-bit CCITT G4 mask candidate (`/ImageMask`), and
+/// additionally gets a 1-bit CCITT G4 opaque grayscale candidate, and
 /// flat-color content gets the indexed candidate. Both are default off: the
 /// JPEG-only pipeline. The pipeline is split in three phases:
 /// 1. **Extract** — detach every eligible image stream from the `Document`
@@ -190,7 +190,7 @@ pub fn compress_images(doc: &mut Document, quality: u8, verbose: bool) {
 /// 3. **Apply** — write the re-encoded streams (and updated `/Filter` +
 ///    `/Length`, plus `/Width` + `/Height` for downsampled images, and
 ///    `/ColorSpace` + palette objects for indexed candidates, and the
-///    `/ImageMask`/`/Decode` entries for mask candidates) back into the
+///    `/ColorSpace`/`Decode` entries for mask candidates) back into the
 ///    object tree in a single serial pass, right before serialization. The
 ///    pass ends by coalescing byte-identical image objects.
 pub fn compress_images_with<T: ImageTranscoder>(
@@ -284,9 +284,10 @@ pub fn compress_images_with<T: ImageTranscoder>(
                 stream
             }
             // Mask candidates carry their full dictionary (phase 2 wrote
-            // /Filter + /DecodeParms + /ImageMask + /BitsPerComponent and
-            // removed /ColorSpace); phase 3 sets the /Decode table — mask
-            // samples paint at decoded 0, so [1 0] maps ink (1) to painted.
+            // /Filter + /DecodeParms + /ColorSpace DeviceGray +
+            // /BitsPerComponent and cleared /ImageMask); phase 3 sets the
+            // /Decode table — [1 0] maps the G4 ink bit (1, BlackIs1) to
+            // decoded 0 = black and paper (0) to 1 = white.
             Reencoded::Mask { mut stream } => {
                 stream
                     .dict
@@ -338,8 +339,9 @@ enum Reencoded {
         hival: u8,
         colorspace: Vec<u8>,
     },
-    /// The stream carries a 1-bit CCITT G4 mask; phase 3 must set
-    /// `/ImageMask` + `/Decode` (the rest of the mask dictionary is already
+    /// The stream carries a 1-bit CCITT G4 opaque grayscale payload; phase
+    /// 3 must set `/Decode` (the rest of the dictionary — `/ColorSpace`
+    /// `DeviceGray`, `/DecodeParms`, `/BitsPerComponent` — is already
     /// written by phase 2).
     Mask { stream: Stream },
 }
@@ -390,9 +392,12 @@ impl IndexedCandidate {
 }
 
 /// A 1-bit CCITT Group 4 mask candidate (`--raster-classify` on bitonal
-/// content). The mask XObject is an `/ImageMask` stencil — one bit per
-/// pixel, painted in the current color — so a text page stored as one RGB
-/// photograph becomes the representation a document compressor should use.
+/// content), written as an *opaque* `DeviceGray` image (not an `/ImageMask`
+/// stencil — a stencil's 0 bits are transparent and its ink inherits the
+/// current color, so it is not a substitute for an opaque raster). The G4
+/// encoding of the 1-bit payload is lossless; the RGB→bitonal conversion
+/// itself is lossy by design, which is why the conservative classifier only
+/// fires on near-perfect black-and-white content.
 struct MaskCandidate {
     /// CCITT G4 fax data (1 = ink).
     g4: Vec<u8>,
@@ -403,7 +408,8 @@ struct MaskCandidate {
 
 impl MaskCandidate {
     /// Full cost: the G4 payload plus the mask dictionary overhead (the
-    /// `/DecodeParms` + `/Decode` entries replace the `/ColorSpace`).
+    /// `/DecodeParms` + `/Decode` entries and the `DeviceGray` color space
+    /// replace the source's `DeviceRGB`).
     fn total_size(&self) -> usize {
         self.g4.len() + PALETTE_OVERHEAD
     }
@@ -777,7 +783,7 @@ fn reencode_image_stream<T: ImageTranscoder>(
                 None
             };
 
-            // A 1-bit CCITT G4 `/ImageMask` candidate for bitonal text.
+            // A 1-bit CCITT G4 opaque-grayscale candidate for bitonal text.
             let mask: Option<MaskCandidate> = decision
                 .as_ref()
                 .filter(|d| d.class == RasterClass::BitonalText)
@@ -938,13 +944,19 @@ fn reencode_image_stream<T: ImageTranscoder>(
             stream
                 .dict
                 .set(b"Length", Object::Integer(stream.content.len() as i64));
-            stream.dict.set(b"ImageMask", Object::Boolean(true));
+            // An *opaque* 1-bit grayscale image, not an /ImageMask stencil:
+            // a stencil paints ink in the current nonstroking color and
+            // treats 0 bits as transparent, so replacing an opaque
+            // black-on-white raster with one would let background content
+            // show through the "white" and recolor the text. As a plain
+            // DeviceGray 1-bit image both states stay real pixels. /Decode
+            // is set by the apply pass: [1 0] maps the G4 ink bit (1,
+            // BlackIs1) to decoded 0 = black and paper (0) to 1 = white.
+            stream
+                .dict
+                .set(b"ColorSpace", Object::Name(b"DeviceGray".to_vec()));
             stream.dict.set(b"BitsPerComponent", Object::Integer(1));
-            // A mask has no /ColorSpace (it is a stencil painted in the
-            // current color); /Decode is set by the apply pass: image-mask
-            // samples paint at decoded 0, so [1 0] maps ink (1, BlackIs1)
-            // to the painted state.
-            stream.dict.remove(b"ColorSpace");
+            stream.dict.remove(b"ImageMask");
             stream.dict.set(
                 b"DecodeParms",
                 Object::Dictionary(dictionary! {

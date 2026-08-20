@@ -125,7 +125,7 @@ presse merge *.png *.pdf
 | `-s, --ssim` | `1.0` | Target output fidelity as measured SSIM (calibrated on grainy scans — the worst case for JPEG — so smoother content exceeds the target); lower = smaller and faster. `1.0` = use `-q` as given |
 | `--palette` | `false` | Also build an `/Indexed` palette candidate for eligible flat-color images (figures, charts, scans) and keep the smallest of original / JPEG / indexed; exact palettes are lossless, lossy ones are gated on 0.9999 native SSIM |
 | `--jpeg-encoder` | `false` | Use the pure-Rust `jpeg-encoder` codec (YCbCr 4:2:0, box-averaged chroma — libjpeg's default model, which Ghostscript/qpdf use) instead of the `image` crate's 4:4:4 encoder; smaller RGB output at the same `-q`, faster, but opt-in because luminance-SSIM courts don't see chroma loss |
-| `--raster-classify` | `false` | Run the raster classifier on every decoded image: bitonal text/rules stored as a photographic RGB raster are re-stored as a lossless 1-bit CCITT G4 `/ImageMask` stencil (an RGB page → a few KB of G4); flat-color figures get the `/Indexed` palette candidate; photos and mixed pages are never masked. The smallest of original / JPEG / indexed / mask wins per image |
+| `--raster-classify` | `false` | Run the raster classifier on every decoded image: bitonal text/rules stored as a photographic RGB raster are re-stored as a 1-bit CCITT G4 opaque `DeviceGray` image (an RGB page → a few KB of G4). The G4 encoding of the 1-bit payload is lossless; the RGB→bitonal conversion itself is lossy, which is why only near-perfect black-and-white content is masked. Flat-color figures get the `/Indexed` palette candidate; photos and mixed pages are never masked. The smallest of original / JPEG / indexed / mask wins per image |
 | `--recompress-flate` | `false` | qpdf-style structural recompression: decode existing `/FlateDecode` streams and re-encode them at the writer's level 9, keeping each only when smaller. Lossless (no content-byte changes); recovers the compression-level gap form tools leave behind |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
@@ -204,9 +204,14 @@ small classifier on every decoded image — an adaptive Otsu threshold,
 sample window (≤1024 px on the long edge) so a 28 MB scan classifies in
 one pass — and routes the content:
 
-- **Bitonal text / rules** → a lossless 1-bit CCITT Group 4 `/ImageMask`
-  stencil (painted in the current color): an RGB text page becomes a few
-  KB of G4, decoded pixel-identically by every viewer.
+- **Bitonal text / rules** → a 1-bit CCITT Group 4 opaque `DeviceGray`
+  image — deliberately *not* an `/ImageMask` stencil, because a stencil's
+  white is transparent and its ink inherits the current graphics color,
+  so it is not a substitute for an opaque raster. An RGB text page
+  becomes a few KB of G4, decoded pixel-identically by every viewer. The
+  G4 encoding is lossless; the RGB→bitonal conversion itself is lossy,
+  which is why the flag only fires on near-perfect black-and-white
+  content.
 - **Flat-color figures** → the `/Indexed` palette candidate.
 - **Photos / mixed pages** → the JPEG path (the within-image split into
   mask + continuous-tone layers is future work).
