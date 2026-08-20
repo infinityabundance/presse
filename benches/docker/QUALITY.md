@@ -444,12 +444,45 @@ rendering checks, text-extraction checks, and the same brutal
 "colored rectangle underneath + non-black current color" trap that
 `--raster-classify` already passes).
 
-Measured on the synthetic corpus (deterministic, best-of-1):
+Measured on the synthetic corpus (`/tmp/presse_smoke/corpus`,
+deterministic, best-of-1, `-q 50`, current tree; the Pareto sweep in
+`benches/docker/pareto.py --optimize` reproduces every cell):
 
 | corpus file | default (`fast`) | `--mrc` | `--jbig2` | `--compression smallest` |
 |---|---|---|---|---|
-| scanned.pdf (3.40 MB, 3 grainy gray pages) | 0.26 MB | 2.3 KB | 1.3 KB | 1.1 KB |
-| image-heavy.pdf (17.98 MB, 60 photos) | ~4.8 MB | — | — | 2.59 MB |
+| scanned.pdf (3.40 MB, 3 grainy gray pages) | 0.27 MB | 2.3 KB | 1.3 KB | 1.1 KB |
+| image-heavy.pdf (17.98 MB, 60 photos, 24 pages) | 1.51 MB | — | — | 1.38 MB |
+
+Where the candidates land on the Pareto matrix (300 dpi render SSIM vs
+the source, `pareto.py --optimize`, same corpus):
+
+- **scanned.pdf — `--mrc` wins the ≥0.999 frontier outright.** The flat
+  two-tone composite is 2.3 KB at render SSIM 0.9997, against qpdf q50
+  0.36 MB / mutool 0.29 MB / presse q50 0.27 MB at the same or lower
+  fidelity, and gs `/screen` 0.48 MB. At ≥0.9999 every full-res tool sits
+  at ~0.56–0.66 MB (presse q75 0.60 MB, qpdf 0.66 MB, mutool 0.56 MB) —
+  the grain-preserving JPEG path, where the flat composite cannot enter
+  because replacing the paper texture costs render fidelity; the
+  ≤0.98 frontier belongs to the bitonal masks (`--jbig2` 1.3 KB and
+  `smallest` 1.1 KB, both at SSIM 0.981 — the texture is gone, which is
+  what "flat" means). The composite thus occupies the region commercial
+  MRC engines aim at: visually lossless scan compression at a tiny
+  fraction of the full-res tools' sizes.
+- **image-heavy.pdf — the codec candidates are honest, not Pareto-new.**
+  `--jpeg2000` wins the per-image size court on the photos (1.38 MB vs
+  1.51 MB at q50) but at render SSIM 0.9931 vs 0.9995 — the runtime
+  gate's per-image ≥0.98 native-window admission is met, yet the
+  document-level point is inside the frontier, dominated by the ssim
+  mode (`d0-s0.86`: 0.28 MB at 0.9967). At ≥0.9999 the frontier is
+  unchanged (presse q75 2.53 MB vs qpdf 1.71 MB, mutool 2.40 MB — the
+  J2K candidate never qualifies there because its admitted reconstructions
+  sit below the gate on this corpus). This is the expected shape for a
+  rate-targeted lossy candidate; nothing claims otherwise.
+- `--dedup` / `--zopfli` / `--font-subset` on these three files are
+  structural no-ops or near-no-ops (photos have no duplicate streams,
+  `smallest` still pays their CPU: 1.46 s vs 0.03 s at q50) — their wins
+  are on duplicate-heavy corpora, where the existing `photos60` Pareto
+  row (6.46 MB, dedup) already shows the effect.
 
 Readings and honest caveats:
 
