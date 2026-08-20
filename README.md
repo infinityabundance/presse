@@ -389,11 +389,13 @@ Runtime needs:
 - **cuda** — an NVIDIA driver and the `nvjpeg` shared library. No CUDA
   toolkit is needed to *build*: the vendor library is loaded at runtime.
   Baseline 4:2:0 JPEGs are additionally decoded on the NVDEC hardware
-  engine through the Video Codec SDK (`libnvcuvid.so.1`, a driver
-  component — no toolkit library involved); the NV12→planar conversion
-  runs a tiny kernel that ships as embedded PTX, JIT-compiled by the
-  driver. Progressive / 4:2:2 / 4:4:4 JPEGs keep the nvJPEG decode path.
-  Validated on an RTX 4080 SUPER with CUDA 13.3 (verify with
+  engine through the Video Codec SDK. The SDK's library (`libnvcuvid.so.1`)
+  ships with the driver; its API declarations come from the SDK headers
+  (`ffnvcodec-headers` on Debian/Ubuntu — the NVDEC stage is written
+  against the cuvid API they declare), so install both. The NV12→planar
+  conversion runs a tiny kernel that ships as embedded PTX, JIT-compiled
+  by the driver. Progressive / 4:2:2 / 4:4:4 JPEGs keep the nvJPEG decode
+  path. Validated on an RTX 4080 SUPER with CUDA 13.3 (verify with
   `cargo run --release --features cuda --example nvdec_verify`).
 - **rocm** — compile-tested only; requires a ROCm installation with
   `rocjpeg` at runtime.
@@ -411,6 +413,46 @@ routing, speed vs size tradeoffs) is documented in
 - CMYK images are not compressed (not currently handled by `image` crate)
 
 ## Dependencies
+
+**A Rust toolchain (1.85+ — the workspace uses edition 2024) is the only
+build requirement.** The default CPU pipeline and the `optimize` passes are
+pure Rust: Cargo compiles every dependency from source, and no system C
+library is linked or needed.
+
+| To use… | You need… |
+|---|---|
+| Default CPU build | nothing beyond Rust |
+| `--features optimize` (JBIG2 / JPEG2000 / MRC / font subset / Zopfli / dedup) | nothing beyond Rust — the codec crates (`jbig2enc-rust`, `j2k`, `zopfli`, `subsetter`) compile from source; the build is heavy, not dependent |
+| `--features cuda` (nvJPEG) | an NVIDIA driver and `libnvjpeg` (loaded at runtime — no CUDA toolkit needed to *build*) |
+| `--features cuda`, NVDEC stage | the above plus the Video Codec SDK: the driver's `libnvcuvid.so.1` **and** the SDK headers (`ffnvcodec-headers` on Debian/Ubuntu, `/usr/include/ffnvcodec/dynlink_nvcuvid.h`) |
+| `--features rocm` | a ROCm installation with `rocjpeg` at runtime |
+
+The regression suite and the benchmark harness additionally want the usual
+PDF tooling (never needed to build, and never needed just to compress a
+PDF):
+
+- **poppler-utils** (`pdftoppm`, `pdfinfo`) — the render witnesses and page
+  counts used by `tests/regression.rs` and `benches/docker/pareto.py`
+- **qpdf** — structural validation (`qpdf --check`) in the tests and in
+  `ci/validate_corpus.py`
+- **ghostscript** — a third renderer/validator and the `/ebook` benchmark
+  opponent
+- **mupdf-tools** (`mutool`) — the independent JPX oracle for
+  `--jpeg2000` and the lossless-repack benchmark opponent
+- **pngquant + tesseract-ocr-eng** — the OCRmyPDF leg of the Pareto sweep
+  (ocrmypdf's `--optimize` mode hard-requires pngquant)
+- **python3 + numpy + Pillow** — the `benches/docker/*.py` harness scripts
+  (`pip install -r benches/docker/requirements.txt`)
+
+Debian/Ubuntu one-liner for the full set (driver packages come from
+NVIDIA's repository; the rest from distro packages):
+
+```bash
+sudo apt install qpdf poppler-utils ghostscript mupdf-tools \
+                 pngquant tesseract-ocr-eng ffnvcodec-headers
+```
+
+Rust crates this project is built on:
 
 - [lopdf](https://github.com/niclasberg/lopdf) — PDF parsing and manipulation
 - [clap](https://github.com/clap-rs/clap) — CLI argument parsing

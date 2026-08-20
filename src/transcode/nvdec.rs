@@ -6,7 +6,10 @@
 //! status 2 — see [`super::cuda`]), so the one remaining hardware-decode
 //! route is the Video Codec SDK: `libnvcuvid.so.1` ships *with the driver*
 //! (not the toolkit), which is why this module dlopens it directly through
-//! `libloading` exactly like the nvJPEG backend does.
+//! `libloading` exactly like the nvJPEG backend does. The API it calls is
+//! the cuvid API declared by the SDK headers (`ffnvcodec-headers` on
+//! Debian/Ubuntu, `/usr/include/ffnvcodec/dynlink_nvcuvid.h`) — the
+//! `CUVID*` structs below mirror those declarations field-for-field.
 //!
 //! # Design rationale
 //!
