@@ -137,8 +137,8 @@ presse merge *.png *.pdf
 | `--zopfli` | `false` | Like `--recompress-flate`, but the re-encode uses the Zopfli deflate search — deliberately CPU-hungry, routinely a few % smaller than level-9 zlib on text/content streams. Strictly-smaller gate; pure size win at CPU cost; requires the `optimize` feature |
 | `--font-subset` | `false` | Subset every embedded TrueType font to the glyphs the content streams actually show (typst's `subsetter`), rewritten as a CID font with a rebuilt `ToUnicode`. Fonts are skipped unless the used-glyph mapping resolves exactly (CFF `FontFile3` programs are not subset) and the subset is strictly smaller; requires the `optimize` feature |
 | `--jbig2` | `false` | Add a lossless JBIG2 (symbol-dictionary) candidate for bitonal content alongside the CCITT G4 one — repeated glyph shapes share one dictionary entry; the size court keeps the smaller of G4 / JBIG2 / original per image; requires the `optimize` feature |
-| `--jpeg2000` | `false` | Add a JPEG2000 (JPXDecode, minimal JP2 file) candidate for continuous-tone images, rate-targeted at 85% of the JPEG candidate's byte budget so the court prefers it only when genuinely smaller at comparable rate; requires the `optimize` feature |
-| `--mrc` | `false` | Build a real mixed-raster composite for classified bitonal scans — a solid paper-color background (median paper color, emitted as a 1×1 image), solid ink-color foreground composited through a high-resolution lossless CCITT G4 mask as its `/SMask`, content rewritten to draw background then foreground (the ABBYY/LEADTOOLS/Pdftools representation); requires the `optimize` feature |
+| `--jpeg2000` | `false` | Add a JPEG2000 (JPXDecode, minimal JP2 file) candidate for continuous-tone images, rate-targeted at 85% of the JPEG candidate's byte budget. The rate target is only a sizing hint: every candidate is decoded back and measured against the source on the native 512-px window, and admitted to the size court only above a 0.98 SSIM gate; requires the `optimize` feature |
+| `--mrc` | `false` | Build a real mixed-raster composite for classified bitonal scans — the current implementation is **flat two-tone MRC**: solid paper-color background (median paper color, emitted as a 1×1 image), solid ink-color foreground composited through a high-resolution lossless CCITT G4 mask as its `/SMask`, content rewritten to draw background then foreground (the ABBYY/LEADTOOLS/Pdftools representation, without the textured-background layer yet); requires the `optimize` feature |
 | `-a, --acceleration` | `cpu` | Image transcoding backend: `cpu`, `auto`, `cuda`, or `rocm` (GPU backends require a feature build — see [GPU acceleration](#gpu-acceleration-experimental)) |
 | `-v, --verbose` | `false` | Print size comparison after each file |
 
@@ -296,12 +296,16 @@ compose; `--compression` presets expand to them:
   continuous-tone images, emitted as a minimal JP2 file (signature /
   file-type / image-header + sRGB / codestream boxes — poppler parses the
   JP2 file form cleanly, where a raw codestream only renders after noisy
-  fallback), rate-targeted at 85% of the JPEG candidate's bytes so it
-  wins only when genuinely smaller at comparable rate. On the 18 MB
-  image-heavy corpus the photo pages re-encode at a mean luma difference
-  of ~1.3 levels. Ghostscript's JPX decoder is broken on *all* JP2 files
-  (including OpenJPEG's own), so the regression oracle is
-  poppler + mutool + OpenJPEG.
+  fallback), rate-targeted at 85% of the JPEG candidate's bytes. The rate
+  target is only a sizing hint: every candidate is decoded back and
+  measured against the source pixels on the native 512-px window
+  (`CandidateEvidence` — SSIM plus luma/chroma/edge error), and admitted
+  to the size court only above a 0.98 native-SSIM gate, so `smallest`
+  can never trade readability for bytes. On the 18 MB image-heavy corpus
+  the photo pages re-encode at a mean luma difference of ~1.3 levels.
+  Ghostscript's JPX decoder is broken on *all* JP2 files (including
+  OpenJPEG's own), so the regression oracle is poppler + mutool +
+  OpenJPEG.
 - **`--mrc`** — the mixed-raster composite commercial scan compressors
   use: a solid paper-color background (the median paper color, emitted as
   a 1×1 image — deliberately *not* a JPEG, because near-flat JPEG
@@ -319,9 +323,16 @@ compose; `--compression` presets expand to them:
   paper or recolor the ink (regression-tested pixel-identically under a
   blue rectangle with a red current color). The mask is always G4:
   poppler's JBIG2 decoder inverts its samples, which would make the mask
-  polarity viewer-dependent. On a 3.4 MB grainy scan corpus the composite
-  lands at ~4 KB with the paper grain preserved as a flat fill (a flat
-  1-bit G4 version is smaller still at ~1 KB but throws the grain away).
+  polarity viewer-dependent. This is **flat / two-tone MRC**: solid paper
+  color + solid ink color + full-resolution lossless mask. On a 3.4 MB
+  grainy scan corpus it lands at ~2.3 KB — the paper texture is *not*
+  preserved (the median color replaces it), which is exactly the
+  deliberate distinction from future **textured / continuous-tone MRC**
+  (a compressed photo background + foreground + mask, the ABBYY-style
+  mechanism) that would sit between plain JPEG and the flat composite on
+  the candidate ladder:
+  `source scan 3.40 MB → JPEG ~260 KB → textured MRC (future) → flat MRC 2.3 KB → JBIG2 1.3 KB` —
+  the fidelity court decides where a document belongs.
   poppler/mutool/ghostscript render the composite pixel-identically; the
   earlier poppler "Bogus memory allocation size" notice on large
   full-bleed masked images was the double-`cm` rewrite bug, fixed here.

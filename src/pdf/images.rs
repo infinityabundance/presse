@@ -45,6 +45,17 @@
 //!    offered only to `FlatColor` content under this flag, so it can never
 //!    turn a photo into a palette. The smallest of original / JPEG /
 //!    indexed / mask wins per image.
+//! 8. **Runtime fidelity admission** (`--jpeg2000`) — every lossy candidate
+//!    is decoded back and measured against the source pixels on the native
+//!    512-px window (`CandidateEvidence`) *before* the size court may rank
+//!    it. JPEG2000 is the first implementation: the 85% rate target is only
+//!    a sizing hint; a candidate that fails to decode, is dimensionally
+//!    unfaithful, or reconstructs below `J2K_SSIM_GATE` never enters the
+//!    size competition. Palette has its own native-SSIM gate
+//!    (`PALETTE_SSIM_GATE`); the bitonal candidates are gated by the
+//!    classifier's measured reconstruction error. `CandidateEvidence` is
+//!    the template every future lossy representation (Jpegli, MRC, …)
+//!    fills.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -498,6 +509,16 @@ pub fn compress_images_opt<T: ImageTranscoder>(
 /// above this native-image SSIM on a 512-px window — the project's stricter
 /// witness, not the 64-px render scale.
 const PALETTE_SSIM_GATE: f64 = 0.9999;
+
+/// `--jpeg2000` admission gate: the decoded candidate must reconstruct to
+/// at least this native-window SSIM before the size court may rank it. The
+/// value matches the threshold the JPEG2000 render regression proves (0.98);
+/// it is deliberately looser than [`PALETTE_SSIM_GATE`] because exact
+/// palettes are lossless while J2K is rate-targeted lossy by design — the
+/// gate exists to catch the *degraded* reconstruction, not to demand
+/// losslessness.
+#[cfg(feature = "optimize")]
+const J2K_SSIM_GATE: f64 = 0.98;
 
 /// Above this many unique colors the raster is photographic; median-cut
 /// quantization costs more than a palette can ever save, so it is skipped.
@@ -1182,8 +1203,15 @@ fn reencode_image_stream<T: ImageTranscoder>(
                     );
                 }
                 // JPEG2000: rate-targeted lossy J2K of the RGB pixels at 85%
-                // of the JPEG candidate's byte budget, so the court prefers
-                // it only when it is genuinely smaller at comparable rate.
+                // of the JPEG candidate's byte budget. The rate target is
+                // only a sizing hint — before this candidate may enter the
+                // size court it is decoded back and measured against the
+                // source pixels (see [`CandidateEvidence`]): the first
+                // implementation of the generic runtime admission court.
+                // A candidate that fails to decode, is dimensionally
+                // unfaithful, or reconstructs below the SSIM gate never
+                // reaches the size competition, so `smallest` can never
+                // trade readability for bytes.
                 if jpeg2000
                     && tag == 3
                     && let Some(j) = jpeg_len
@@ -1193,9 +1221,21 @@ fn reencode_image_stream<T: ImageTranscoder>(
                         eh,
                         (j as u64 * 85) / 100,
                     )
+                    && let Some(ev) = j2k_candidate_evidence(&cs, key_bytes, ew, eh)
+                    && ev.ssim >= J2K_SSIM_GATE
                 {
+                    verbose!(
+                        verbose,
+                        "[img {:?}] → jpeg2000 admitted: {}B ssim {:.4} (luma err {:.2},                          chroma err {:.2}, edge err {:.2})",
+                        id,
+                        ev.bytes,
+                        ev.ssim,
+                        ev.luma_error,
+                        ev.chroma_error,
+                        ev.edge_error
+                    );
                     consider(
-                        cs.len(),
+                        ev.bytes,
                         Candidate::Jpeg2000 {
                             buf: cs,
                             dims: resampled,
@@ -1886,26 +1926,41 @@ fn map_to_palette(rgb: &[u8], palette: &[[u8; 3]]) -> Vec<u8> {
         .collect()
 }
 
-/// Mean luma SSIM between two equal-sized RGB rasters, on a window of at
-/// most 512 px on the long edge — the project's native-image witness scale
-/// (see `benches/docker/native_image_ssim.py`).
-fn ssim_window(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
+/// Resize two RGB buffers to the project's native comparison window: the
+/// long side capped at 512 px with the same Triangle filter the render
+/// witnesses use, so every fidelity metric is measured at one consistent
+/// resolution. `width`/`height` are the buffers' source dimensions.
+fn native_windows(
+    a: &[u8],
+    b: &[u8],
+    width: u32,
+    height: u32,
+) -> (image::RgbImage, image::RgbImage) {
     let long = width.max(height);
     let n = long.min(512);
-    let to_luma = |pixels: &[u8]| {
+    let to_rgb = |pixels: &[u8]| {
         let img =
             image::RgbImage::from_raw(width, height, pixels.to_vec()).expect("validated RGB dims");
-        let resized = image::imageops::resize(&img, n, n, image::imageops::FilterType::Triangle);
-        image::DynamicImage::ImageRgb8(resized).to_luma8()
+        image::imageops::resize(&img, n, n, image::imageops::FilterType::Triangle)
     };
-    let (a, b) = (to_luma(a), to_luma(b));
-    let count = (n * n) as f64;
+    (to_rgb(a), to_rgb(b))
+}
+
+/// Rec. 601 luma reduction of a resized RGB window — the same conversion
+/// the render witnesses use.
+fn luma_of(img: &image::RgbImage) -> image::GrayImage {
+    image::DynamicImage::ImageRgb8(img.clone()).to_luma8()
+}
+
+/// SSIM of two equal-size luma images.
+fn ssim_luma(a: &image::GrayImage, b: &image::GrayImage) -> f64 {
+    let count = (a.width() * a.height()) as f64;
     let mean = |img: &image::GrayImage| img.pixels().map(|p| p[0] as f64).sum::<f64>() / count;
-    let (ma, mb) = (mean(&a), mean(&b));
+    let (ma, mb) = (mean(a), mean(b));
     let var = |img: &image::GrayImage, m: f64| {
         img.pixels().map(|p| (p[0] as f64 - m).powi(2)).sum::<f64>() / count
     };
-    let (va, vb) = (var(&a, ma), var(&b, mb));
+    let (va, vb) = (var(a, ma), var(b, mb));
     let cov = a
         .pixels()
         .zip(b.pixels())
@@ -1915,6 +1970,141 @@ fn ssim_window(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
     let c1 = (0.01f64 * 255.0).powi(2);
     let c2 = (0.03f64 * 255.0).powi(2);
     ((2.0 * ma * mb + c1) * (2.0 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+}
+
+/// Mean luma SSIM between two equal-sized RGB rasters, on a window of at
+/// most 512 px on the long edge — the project's native-image witness scale
+/// (see `benches/docker/native_image_ssim.py`).
+fn ssim_window(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
+    let (a, b) = native_windows(a, b, width, height);
+    ssim_luma(&luma_of(&a), &luma_of(&b))
+}
+
+/// Measured reconstruction fidelity of one lossy candidate: the candidate is
+/// decoded back and compared against the source pixels on the project's
+/// native 512-px window, and only then may the size court rank it.
+///
+/// This is the generic admission interface every future lossy representation
+/// (JPEG, Jpegli, palette, MRC, …) is expected to fill — a candidate earns
+/// its place by *measured* quality, never by construction heuristics or
+/// byte-budget ratios alone. JPEG2000 is the first implementation.
+#[cfg(feature = "optimize")]
+struct CandidateEvidence {
+    /// Encoded candidate size in bytes — what the size court ranks on.
+    bytes: usize,
+    /// Native-window SSIM (Rec. 601 luma, 512-px Triangle resize) — the
+    /// same witness the render courts use.
+    ssim: f64,
+    /// Mean absolute luma difference on the native window (0–255 scale).
+    luma_error: f64,
+    /// Mean absolute per-channel RGB difference on the native window
+    /// (0–255 scale).
+    chroma_error: f64,
+    /// Mean absolute Sobel-edge magnitude difference on the native window
+    /// (0–255 scale) — the sharpness / text-fidelity witness. Blurring (the
+    /// typical rate-targeted failure mode) shows up here even when mean
+    /// luma error stays small.
+    edge_error: f64,
+}
+
+/// Decode a JP2 candidate and measure it against the source RGB pixels on
+/// the native comparison window ([`native_windows`]). `None` means the
+/// candidate cannot be decoded or is not dimensionally faithful — it must
+/// not enter the size court.
+#[cfg(feature = "optimize")]
+fn j2k_candidate_evidence(cs: &[u8], rgb: &[u8], w: u32, h: u32) -> Option<CandidateEvidence> {
+    let mut decoder = j2k::J2kDecoder::new(cs).ok()?;
+    let img = decoder.decode_srgb8().ok()?;
+    let (dw, dh) = img.dimensions();
+    if dw != w || dh != h {
+        // A candidate that silently changes resolution is not a faithful
+        // substitute for the source — reject it outright.
+        return None;
+    }
+    // Normalize the decoded layout to interleaved RGB so the comparison is
+    // apples-to-apples with the source key bytes.
+    // `J2kSrgb8Layout` is `#[non_exhaustive]`: an unknown future layout
+    // cannot be compared faithfully, so the candidate is rejected.
+    let decoded: Vec<u8> = match img.layout() {
+        j2k::J2kSrgb8Layout::Gray => img.data().iter().flat_map(|&v| [v, v, v]).collect(),
+        j2k::J2kSrgb8Layout::Rgb => img.data().to_vec(),
+        j2k::J2kSrgb8Layout::Rgba => img
+            .data()
+            .chunks_exact(4)
+            .flat_map(|c| [c[0], c[1], c[2]])
+            .collect(),
+        _ => return None,
+    };
+    let (ra, rb) = native_windows(rgb, &decoded, w, h);
+    let (la, lb) = (luma_of(&ra), luma_of(&rb));
+    Some(CandidateEvidence {
+        bytes: cs.len(),
+        ssim: ssim_luma(&la, &lb),
+        luma_error: mean_abs_diff(&la, &lb),
+        chroma_error: mean_abs_rgb_diff(&ra, &rb),
+        edge_error: edge_mae(&la, &lb),
+    })
+}
+
+/// Mean absolute luma difference of two equal-size gray images (0–255
+/// scale).
+#[cfg(feature = "optimize")]
+fn mean_abs_diff(a: &image::GrayImage, b: &image::GrayImage) -> f64 {
+    let count = (a.width() * a.height()) as f64;
+    a.pixels()
+        .zip(b.pixels())
+        .map(|(x, y)| (x[0] as f64 - y[0] as f64).abs())
+        .sum::<f64>()
+        / count
+}
+
+/// Mean absolute per-channel difference of two equal-size RGB images
+/// (0–255 scale, all three channels pooled).
+#[cfg(feature = "optimize")]
+fn mean_abs_rgb_diff(a: &image::RgbImage, b: &image::RgbImage) -> f64 {
+    let count = (a.width() * a.height() * 3) as f64;
+    a.pixels()
+        .zip(b.pixels())
+        .map(|(x, y)| {
+            (x[0] as f64 - y[0] as f64).abs()
+                + (x[1] as f64 - y[1] as f64).abs()
+                + (x[2] as f64 - y[2] as f64).abs()
+        })
+        .sum::<f64>()
+        / count
+}
+
+/// Sobel gradient magnitude at one pixel of a luma image, zero outside the
+/// border, clamped to the 0–255 range.
+#[cfg(feature = "optimize")]
+fn sobel_mag(img: &image::GrayImage, x: u32, y: u32) -> f64 {
+    let (w, h) = (img.width(), img.height());
+    let at = |dx: i32, dy: i32| {
+        let (px, py) = (x as i32 + dx, y as i32 + dy);
+        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+            0.0
+        } else {
+            f64::from(img.get_pixel(px as u32, py as u32)[0])
+        }
+    };
+    let gx = (at(-1, -1) + 2.0 * at(-1, 0) + at(-1, 1)) - (at(1, -1) + 2.0 * at(1, 0) + at(1, 1));
+    let gy = (at(-1, -1) + 2.0 * at(0, -1) + at(1, -1)) - (at(-1, 1) + 2.0 * at(0, 1) + at(1, 1));
+    (gx * gx + gy * gy).sqrt().min(255.0)
+}
+
+/// Mean absolute Sobel-magnitude difference of two equal-size luma images —
+/// the sharpness witness.
+#[cfg(feature = "optimize")]
+fn edge_mae(a: &image::GrayImage, b: &image::GrayImage) -> f64 {
+    let (w, h) = (a.width(), a.height());
+    let count = (w * h) as f64;
+    let mut sum = 0.0;
+    for y in 0..h {
+        for x in 0..w {
+            sum += (sobel_mag(a, x, y) - sobel_mag(b, x, y)).abs();
+        }
+    }
+    sum / count
 }
 
 /// Identity of one image stream for coalescing: canonical dict bytes (sans
@@ -2098,7 +2288,10 @@ pub(crate) fn canonical_object(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_histogram, calibrated_quality, indexed_candidate, median_cut};
+    use super::{
+        J2K_SSIM_GATE, build_histogram, calibrated_quality, indexed_candidate,
+        j2k_candidate_evidence, median_cut,
+    };
 
     /// A tiny photo-ish gradient with per-pixel noise (photographic content).
     fn photoish(w: u32, h: u32) -> Vec<u8> {
@@ -2185,6 +2378,71 @@ mod tests {
         if let Some(c) = cand {
             assert_eq!(c.indices.len(), (w * h) as usize, "one index per pixel");
         }
+    }
+
+    /// The JPEG2000 runtime admission gate: a candidate is decoded back and
+    /// measured against the source pixels (see [`CandidateEvidence`]), and
+    /// only a reconstruction above [`J2K_SSIM_GATE`] may enter the size
+    /// court. The clean photo clears the gate; the heavy-noise photo at the
+    /// same rate target degrades below it; garbage bytes produce no
+    /// evidence at all.
+    #[test]
+    #[cfg(feature = "optimize")]
+    fn j2k_runtime_gate_admits_clean_and_rejects_degraded() {
+        use crate::pdf::optimize::codecs::j2k_encode_rgb;
+        use crate::transcode::{CpuTranscoder, ImageRef, ImageTranscoder, Input};
+
+        let (w, h) = (512u32, 384u32);
+        let clean = photoish(w, h);
+        let heavy: Vec<u8> = {
+            let mut next: u64 = 42;
+            let mut v = Vec::with_capacity((w * h * 3) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    next ^= next << 13;
+                    next ^= next >> 7;
+                    next ^= next << 17;
+                    let n = (next & 0x7f) as u8;
+                    let (r, g, b) = (
+                        (x as f32 / w as f32 * 255.0) as u8,
+                        (y as f32 / h as f32 * 255.0) as u8,
+                        (128.0 + 80.0 * ((x as f32 + y as f32) / 32.0).sin()) as u8,
+                    );
+                    v.extend_from_slice(&[r.wrapping_add(n), g.wrapping_add(n), b.wrapping_add(n)]);
+                }
+            }
+            v
+        };
+        let t = CpuTranscoder::default();
+        let encode = |pixels: &[u8]| {
+            let jpeg = t
+                .transcode_image(
+                    &Input::Pixels(ImageRef::Rgb8 {
+                        width: w,
+                        height: h,
+                        bytes: pixels,
+                    }),
+                    50,
+                )
+                .unwrap();
+            j2k_encode_rgb(pixels, w, h, (jpeg.len() as u64 * 85) / 100).unwrap()
+        };
+        let ev = j2k_candidate_evidence(&encode(&clean), &clean, w, h).expect("clean decodes");
+        assert!(
+            ev.ssim >= J2K_SSIM_GATE,
+            "clean photo must clear the gate: ssim {:.4}",
+            ev.ssim
+        );
+        let ev = j2k_candidate_evidence(&encode(&heavy), &heavy, w, h).expect("noisy decodes");
+        assert!(
+            ev.ssim < J2K_SSIM_GATE,
+            "heavy-noise photo must fail the gate: ssim {:.4}",
+            ev.ssim
+        );
+        assert!(
+            j2k_candidate_evidence(b"not a jp2 file", &clean, w, h).is_none(),
+            "undecodable bytes must never produce evidence"
+        );
     }
 
     #[test]

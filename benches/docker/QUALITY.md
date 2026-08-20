@@ -434,7 +434,11 @@ enables the default-off heavy passes behind `--compression
 *candidate* in the same size court as the image pipeline, or a
 strictly-smaller-gated structural rewrite, and every one is validated by
 per-image fidelity gates (palette ≥0.9999 native SSIM; the bitonal masks —
-G4/JBIG2/MRC — on the classifier's measured reconstruction-error gate)
+G4/JBIG2/MRC — on the classifier's measured reconstruction-error gate;
+JPEG2000 on a runtime decode-back gate — the candidate is decoded and
+measured against the source pixels on the native 512-px window and
+admitted to the size court only above 0.98 SSIM, so the 85%-of-JPEG rate
+target is a sizing hint rather than a quality assumption)
 plus the regression suite (qpdf/poppler/mutool/gs gates, pixel-identical
 rendering checks, text-extraction checks, and the same brutal
 "colored rectangle underneath + non-black current color" trap that
@@ -450,17 +454,23 @@ Measured on the synthetic corpus (deterministic, best-of-1):
 Readings and honest caveats:
 
 - The **scanned** row shows the three bitonal regimes: `fast` pays
-  photographic cost for document content (0.26 MB), `--mrc` keeps the
-  paper color as a flat 1×1 fill while the text lives in a lossless G4
-  mask (2.3 KB, mean luma diff 1.6 vs the source at 30 dpi, visually the
-  closest of the three to the original — the earlier downsampled-JPEG
-  background was dropped because near-flat JPEG bitstreams are
-  mis-decoded as full-page gradients by poppler and Ghostscript), and
-  `--jbig2` / `smallest` collapse the page to a flat 1-bit mask (~1 KB,
-  pixel-identical to the equivalent `--raster-classify` G4 output — the
-  grain is gone, as with any bitonal representation). The size court
-  picks the smallest per image, so on real scans the winner depends on
-  how much paper texture is worth keeping.
+  photographic cost for document content (0.26 MB), `--mrc` builds the
+  **flat two-tone** composite — solid paper color (a 1×1 fill, median of
+  the classified paper) + solid ink color + full-resolution lossless G4
+  mask (2.3 KB, mean luma diff 1.6 vs the source at 30 dpi — the earlier
+  downsampled-JPEG background was dropped because near-flat JPEG
+  bitstreams are mis-decoded as full-page gradients by poppler and
+  Ghostscript), and `--jbig2` / `smallest` collapse the page to a flat
+  1-bit mask (~1 KB, pixel-identical to the equivalent
+  `--raster-classify` G4 output — the grain is gone, as with any bitonal
+  representation). Note what "flat" means here: the median paper color
+  *replaces* the paper texture, so flat MRC sits at the bottom of the
+  candidate ladder (`source scan 3.40 MB → JPEG ~260 KB → textured MRC —
+  compressed background + foreground + mask, the ABBYY-style mechanism,
+  future work → flat MRC 2.3 KB → JBIG2 1.3 KB`) and the fidelity court
+  decides where a document belongs. The size court picks the smallest per
+  image, so on real scans the winner depends on how much paper texture is
+  worth keeping.
 - **`--jpeg2000`** re-encodes the 60-photo corpus to ~2.6 MB (the same
   order as `--jpeg2000` alone: 2.59 MB) at a mean luma difference of
   ~1.3 levels vs the source on sampled pages — visually equivalent, but

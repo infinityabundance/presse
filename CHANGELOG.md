@@ -77,14 +77,19 @@ All notable changes to this project will be documented in this file.
   candidate (pure-Rust `j2k` codec) for continuous-tone images, emitted as
   a minimal JP2 file (signature / file-type / image-header + sRGB /
   codestream boxes) so poppler decodes it cleanly, rate-targeted at 85% of
-  the JPEG candidate's bytes so it wins only when genuinely smaller at
-  comparable rate.
-- **`--mrc`** (`optimize` feature, off by default) — the mixed-raster
-  composite commercial scan compressors use: a solid paper-color
-  background (the median paper color, emitted as a 1×1 image — never a
-  JPEG, since near-flat JPEG bitstreams are mis-decoded as full-page
-  gradients by poppler and Ghostscript), solid ink-color foreground
-  composited through a high-resolution lossless CCITT G4 mask as its
+  the JPEG candidate's bytes. The rate target is only a sizing hint: every
+  candidate is decoded back and measured against the source pixels on the
+  native 512-px window (`CandidateEvidence` — SSIM plus luma/chroma/edge
+  error), and admitted to the size court only above a 0.98 native-SSIM
+  gate — the first implementation of the generic runtime fidelity court
+  every future lossy representation is expected to fill.
+- **`--mrc`** (`optimize` feature, off by default) — **flat two-tone
+  mixed-raster content**: the composite commercial scan compressors use,
+  minus the textured-background layer. A solid paper-color background (the
+  median paper color, emitted as a 1×1 image — never a JPEG, since
+  near-flat JPEG bitstreams are mis-decoded as full-page gradients by
+  poppler and Ghostscript), solid ink-color foreground composited through
+  a high-resolution lossless CCITT G4 mask as its
   `/SMask` (a full image XObject — Ghostscript silently drops a soft mask
   without `/Type /XObject` + `/Subtype /Image`), with the content streams
   rewritten to draw background then foreground *without* re-applying the

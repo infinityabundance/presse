@@ -328,7 +328,7 @@ fn bounded_dims(width: u32, height: u32, edge: u32) -> (u32, u32) {
     (sw, sh)
 }
 
-fn luma8(r: u8, g: u8, b: u8) -> u8 {
+pub(crate) fn luma8(r: u8, g: u8, b: u8) -> u8 {
     // Rec. 601 luma, same weights the render witnesses use.
     ((299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000) as u8
 }

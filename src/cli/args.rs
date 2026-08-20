@@ -237,9 +237,11 @@ Default (flag omitted): JPEG-only pipeline, current behavior."
             default_value_t = false,
             long_help = "Add a JPEG2000 (JPXDecode) candidate for continuous-tone images
   (pure-Rust j2k codec, rate-targeted lossy encode at 85% of the JPEG
-  candidate's bit budget, so the size court only prefers it when it is
-  genuinely smaller at comparable rate). Requires a build with the
-  `optimize` feature."
+  candidate's bit budget). The rate target is only a sizing hint: every
+  candidate is decoded back and measured against the source pixels on the
+  native 512-px window, and admitted to the size court only above a 0.98
+  native-SSIM gate (candidate evidence: luma/chroma/edge error + SSIM).
+  Requires a build with the `optimize` feature."
         )]
         jpeg2000: bool,
 
@@ -247,17 +249,18 @@ Default (flag omitted): JPEG-only pipeline, current behavior."
         #[arg(
             long,
             default_value_t = false,
-            long_help = "For classified bitonal scans, build a real MRC composite instead of
-  a flat 1-bit image: a solid paper-color background (the median paper
-  color, emitted as a 1×1 image), a high-resolution lossless CCITT G4
-  mask, and a solid foreground color layer composited with the mask as
-  its /SMask — the representation commercial scan compressors
-  (ABBYY/LEADTOOLS/Pdftools) use. The page content is rewritten to draw
-  background then foreground, and the candidate is kept only when
-  strictly smaller than the source and the JPEG candidate. (The mask is
-  always G4: poppler's JBIG2 decoder inverts its samples, which would
-  make the SMask polarity viewer-dependent.) Requires a build with the
-  `optimize` feature."
+            long_help = "For classified bitonal scans, build a flat two-tone MRC composite
+  (solid paper-color background + solid ink-color foreground + a
+  high-resolution lossless CCITT G4 mask as its /SMask) instead of a flat
+  1-bit image: the background is the median paper color emitted as a 1×1
+  image, the foreground is composited through the mask — the
+  representation commercial scan compressors (ABBYY/LEADTOOLS/Pdftools)
+  use, minus their textured-background layer (future work). The page
+  content is rewritten to draw background then foreground, and the
+  candidate is kept only when strictly smaller than the source and the
+  JPEG candidate. (The mask is always G4: poppler's JBIG2 decoder
+  inverts its samples, which would make the SMask polarity
+  viewer-dependent.) Requires a build with the `optimize` feature."
         )]
         mrc: bool,
 

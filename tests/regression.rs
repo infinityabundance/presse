@@ -3637,6 +3637,107 @@ fn jpeg2000_candidate_decodes_and_renders() {
     }
 }
 
+/// `--jpeg2000` runtime fidelity admission at the pipeline level: the gate
+/// is measured on the decoded candidate itself (see `CandidateEvidence`),
+/// not assumed from the 85%-of-JPEG rate target. The clean photo
+/// reconstructs above the SSIM gate and is admitted as JPXDecode; the
+/// heavy-noise photo at the same rate target degrades below the gate and
+/// must NOT be admitted — the JPEG candidate wins instead, so `smallest`
+/// can never trade readability for bytes.
+#[test]
+#[cfg(feature = "optimize")]
+fn jpeg2000_runtime_gate_admits_clean_and_rejects_degraded() {
+    let dir = test_dir();
+    let (w, h) = (512u32, 384u32);
+    let heavy = {
+        let mut next = xorshift(42);
+        let mut v = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = (
+                    (x as f32 / w as f32 * 255.0) as u8,
+                    (y as f32 / h as f32 * 255.0) as u8,
+                    (128.0 + 80.0 * ((x as f32 + y as f32) / 32.0).sin()) as u8,
+                );
+                let n = (next() & 0x7f) as u8;
+                v.extend_from_slice(&[r.wrapping_add(n), g.wrapping_add(n), b.wrapping_add(n)]);
+            }
+        }
+        v
+    };
+
+    let build = |dir: &Path, name: &str, pixels: Vec<u8>| {
+        let (mut doc, pages_id) = new_doc();
+        let mut image_dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => w as i64,
+            "Height" => h as i64,
+            "BitsPerComponent" => 8,
+        };
+        image_dict.set("ColorSpace", "DeviceRGB");
+        let mut image_stream = Stream::new(image_dict, pixels);
+        image_stream.compress().unwrap();
+        let image_id = doc.add_object(image_stream);
+        let content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![
+                        w.into(),
+                        0.into(),
+                        0.into(),
+                        h.into(),
+                        50.into(),
+                        100.into(),
+                    ],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+        });
+        push_kid(&mut doc, pages_id, page_id);
+        compress_images_opt(
+            &mut doc,
+            QualityMode::fixed(QUALITY),
+            false,
+            &CpuTranscoder::default(),
+            CompressOptions {
+                jpeg2000: true,
+                ..CompressOptions::default()
+            },
+        );
+        save_pdf(&mut doc, dir.join(name).to_str().unwrap()).unwrap();
+    };
+
+    build(&dir, "j2k-clean.pdf", photoish_rgb(w, h));
+    build(&dir, "j2k-noisy.pdf", heavy);
+
+    let clean = Document::load(dir.join("j2k-clean.pdf")).unwrap();
+    assert!(
+        find_image_streams(&clean).iter().any(|(_, _, d)| {
+            d.get(b"Filter").and_then(|f| f.as_name()).ok() == Some(b"JPXDecode".as_slice())
+        }),
+        "the clean photo must be admitted as JPXDecode"
+    );
+    let noisy = Document::load(dir.join("j2k-noisy.pdf")).unwrap();
+    assert!(
+        !find_image_streams(&noisy).iter().any(|(_, _, d)| {
+            d.get(b"Filter").and_then(|f| f.as_name()).ok() == Some(b"JPXDecode".as_slice())
+        }),
+        "the heavy-noise photo must be rejected by the runtime fidelity gate"
+    );
+}
+
 /// `--font-subset`: an embedded TrueType font is subset to the used glyphs,
 /// the content is rewritten to CID codes, and the page renders
 /// pixel-identically with text extraction intact.

@@ -1393,13 +1393,15 @@ pub(crate) mod codecs {
         ftyp.extend_from_slice(&0u32.to_be_bytes());
         ftyp.extend_from_slice(b"jp2 ");
         out.extend_from_slice(&box_(20, b"ftyp", &ftyp));
-        // Image header: height, width, 3 components, 8-bit unsigned (0x87),
-        // JPEG 2000 compression (7), unknown colourspace flag 0.
+        // Image header: height, width, 3 components, 8-bit unsigned (0x07;
+        // 0x87 would mean *signed* 8-bit and every strict JP2 validator
+        // rejects the mismatch against our unsigned codestream), JPEG 2000
+        // compression (7), unknown colourspace flag 0.
         let mut ihdr = Vec::with_capacity(14);
         ihdr.extend_from_slice(&h.to_be_bytes());
         ihdr.extend_from_slice(&w.to_be_bytes());
         ihdr.extend_from_slice(&3u16.to_be_bytes());
-        ihdr.extend_from_slice(&[0x87, 7, 0, 0]);
+        ihdr.extend_from_slice(&[0x07, 7, 0, 0]);
         // Colour box: enumerated, sRGB (16).
         let mut colr = Vec::with_capacity(9);
         colr.extend_from_slice(&[1, 0, 0]);
