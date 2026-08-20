@@ -62,6 +62,15 @@ workloads (IRS 1040 instructions 1.5×, the 1310-page PDF 1.4 reference
 1.4×, Unicode 15.0 1.4× — zlib-rs) and duplicate-heavy papers (cycleGAN
 1.1×, 41% duplicate images in GPT-3 — dedup).
 
+Follow-up writer/decode work (this PR): the save path's object renumbering
+is now a linear hash-map pass instead of lopdf's O(n²) `Vec::contains`
+walk — the 67k-object document's save drops **530 → 62 ms** — and the dedup
+cache's key hash is bounded to length + first/last 4 KiB so a unique
+multi-MB scan costs a few KiB of hashing, with equality still on exact
+bytes. On the GPU path, baseline 4:2:0 JPEGs decode on the NVDEC engine
+(~1.4× per-image on large photos; a wash on the batched corpus — see the
+GPU section below).
+
 Speedup scales with image count (the parallelized phase):
 
 | images in doc | docs | mean speedup |
