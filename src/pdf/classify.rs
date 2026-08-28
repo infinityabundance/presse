@@ -90,9 +90,9 @@ const MAX_RECON_MEAN_ERR: f64 = 10.0;
 /// RGB→bitonal conversion would discard: a genuine bitonal scan has tiny
 /// in-class variance (the Otsu split is clean, only anti-aliased glyph
 /// edges deviate), while a photograph or gradient that the heuristic rules
-/// happened to pass still fails here. The mask candidates (G4, JBIG2, MRC)
-/// are gated on this, turning "the classifier is conservative" into a
-/// per-image measurement.
+/// happened to pass still fails here. The mask candidate (G4) is gated on
+/// this, turning "the classifier is conservative" into a per-image
+/// measurement.
 pub fn reconstruction_error(luma: &[u8], mask: &[u8]) -> f64 {
     let n = luma.len() as f64;
     if n == 0.0 {
