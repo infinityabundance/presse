@@ -1561,7 +1561,7 @@ fn classify_raw<'a>(
         _ if raw.len() == area.checked_mul(4)? => {
             let mut rgb = Vec::with_capacity(area * 3);
             for chunk in raw.chunks(CHUNK_SIZE) {
-                for px in chunk.chunks_exact(4) {
+                for px in chunk.as_chunks::<4>().0 {
                     rgb.extend_from_slice(&px[..3]);
                 }
             }
@@ -1744,8 +1744,10 @@ fn indexed_candidate(rgb: &[u8], width: u32, height: u32) -> Option<IndexedCandi
             palette.extend_from_slice(c);
         }
         let indices: Vec<u8> = rgb
-            .chunks_exact(3)
-            .map(|px| index_of[&[px[0], px[1], px[2]]])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|px| index_of[px])
             .collect();
         return Some(IndexedCandidate {
             palette,
@@ -1799,8 +1801,8 @@ fn build_histogram(rgb: &[u8]) -> Histogram {
     let mut index: HashMap<[u8; 3], u32> = HashMap::new();
     let mut colors = Vec::new();
     let mut counts = Vec::new();
-    for px in rgb.chunks_exact(3) {
-        let c = [px[0], px[1], px[2]];
+    for px in rgb.as_chunks::<3>().0 {
+        let c = *px;
         match index.entry(c) {
             std::collections::hash_map::Entry::Occupied(e) => {
                 counts[*e.get() as usize] += 1;
@@ -1906,9 +1908,11 @@ fn median_cut(hist: &Histogram) -> Vec<[u8; 3]> {
 /// memoized per distinct color so flat regions pay for the search once.
 fn map_to_palette(rgb: &[u8], palette: &[[u8; 3]]) -> Vec<u8> {
     let mut memo: HashMap<[u8; 3], u8> = HashMap::new();
-    rgb.chunks_exact(3)
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
         .map(|px| {
-            let c = [px[0], px[1], px[2]];
+            let c = *px;
             *memo.entry(c).or_insert_with(|| {
                 palette
                     .iter()
@@ -2030,7 +2034,9 @@ fn j2k_candidate_evidence(cs: &[u8], rgb: &[u8], w: u32, h: u32) -> Option<Candi
         j2k::J2kSrgb8Layout::Rgb => img.data().to_vec(),
         j2k::J2kSrgb8Layout::Rgba => img
             .data()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|c| [c[0], c[1], c[2]])
             .collect(),
         _ => return None,
@@ -2163,7 +2169,7 @@ fn coalesce_image_objects(doc: &mut Document) -> usize {
     // Rewrite every reference in the whole object graph and the trailer
     // (not just objects reachable from /Root), so no dangling reference
     // survives.
-    for (_, obj) in doc.objects.iter_mut() {
+    for obj in doc.objects.values_mut() {
         rewrite_references(obj, &replace);
     }
     for (_, v) in doc.trailer.iter_mut() {
@@ -2288,10 +2294,7 @@ pub(crate) fn canonical_object(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        J2K_SSIM_GATE, build_histogram, calibrated_quality, indexed_candidate,
-        j2k_candidate_evidence, median_cut,
-    };
+    use super::{build_histogram, calibrated_quality, indexed_candidate, median_cut};
 
     /// A tiny photo-ish gradient with per-pixel noise (photographic content).
     fn photoish(w: u32, h: u32) -> Vec<u8> {
@@ -2387,8 +2390,9 @@ mod tests {
     /// same rate target degrades below it; garbage bytes produce no
     /// evidence at all.
     #[test]
-    #[cfg(feature = "optimize")]
+    #[cfg(all(test, feature = "optimize"))]
     fn j2k_runtime_gate_admits_clean_and_rejects_degraded() {
+        use super::{J2K_SSIM_GATE, j2k_candidate_evidence};
         use crate::pdf::optimize::codecs::j2k_encode_rgb;
         use crate::transcode::{CpuTranscoder, ImageRef, ImageTranscoder, Input};
 

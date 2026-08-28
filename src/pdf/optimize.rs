@@ -82,7 +82,7 @@ pub fn dedup_streams(doc: &mut Document) -> usize {
         return 0;
     }
 
-    for (_, obj) in doc.objects.iter_mut() {
+    for obj in doc.objects.values_mut() {
         rewrite_references(obj, &replace);
     }
     for (_, v) in doc.trailer.iter_mut() {
@@ -102,7 +102,7 @@ pub fn dedup_streams(doc: &mut Document) -> usize {
 #[cfg(feature = "optimize")]
 pub fn recompress_flate_zopfli(doc: &mut Document) -> usize {
     let mut recompressed = 0;
-    for (_, obj) in doc.objects.iter_mut() {
+    for obj in doc.objects.values_mut() {
         let Object::Stream(stream) = obj else {
             continue;
         };

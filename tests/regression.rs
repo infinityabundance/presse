@@ -15,12 +15,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use image::{GenericImageView, GrayImage};
+#[cfg(feature = "optimize")]
+use image::GenericImageView;
+use image::GrayImage;
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
-use presse::pdf::images::{
-    CompressOptions, QualityMode, compress_images, compress_images_opt, compress_images_with,
-};
+#[cfg(feature = "optimize")]
+use presse::pdf::images::{CompressOptions, compress_images_opt};
+use presse::pdf::images::{QualityMode, compress_images, compress_images_with};
 use presse::pdf::writer::{compress_and_save_pdf, recompress_flate, renumber_objects, save_pdf};
 use presse::transcode::{
     Acceleration, CpuTranscoder, FallbackTranscoder, ImageTranscoder, Input, RuntimeTranscoder,
@@ -3125,6 +3127,7 @@ fn classifier_gate_rejects_continuous_tone_on_paper() {
 
 /// Render the first page at an explicit resolution (the shared helper is 72
 /// dpi; the transform regressions need 300 dpi ink-location precision).
+#[cfg(feature = "optimize")]
 fn render_first_page_at(pdf: &Path, prefix: &Path, dpi: &str) -> bool {
     let output = Command::new("pdftoppm")
         .args(["-singlefile", "-png", "-r", dpi, "-f", "1", "-l", "1"])

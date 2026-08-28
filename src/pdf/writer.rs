@@ -24,7 +24,7 @@ use crate::pdf::images::zlib_encode;
 /// only the compressed representation differs.
 pub fn recompress_flate(doc: &mut Document) -> usize {
     let mut recompressed = 0;
-    for (_, obj) in doc.objects.iter_mut() {
+    for obj in doc.objects.values_mut() {
         let Object::Stream(stream) = obj else {
             continue;
         };
@@ -126,7 +126,7 @@ pub fn renumber_objects(doc: &mut Document) {
         }
     }
 
-    for (_, obj) in doc.objects.iter_mut() {
+    for obj in doc.objects.values_mut() {
         rewrite(obj, &replace);
     }
     for (_, v) in doc.trailer.iter_mut() {
